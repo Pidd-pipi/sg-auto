@@ -10,7 +10,7 @@ from unittest import mock
 APP = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP))
 
-from api.common import atomic_write_json  # noqa: E402
+from api.common import MonitorError, atomic_write_json  # noqa: E402
 from api.scheduler import ContainerLedger, JobManager, QueueManager, ReconcileLoop  # noqa: E402
 from api.tasks import DockerCache  # noqa: E402
 from tests.support import SchedulerTestCase, make_config, state_dir_of, write_task  # noqa: E402
@@ -338,11 +338,18 @@ class SlotLifecycleTests(SchedulerTestCase):
     def _queue(self):
         return build_queue(self.config)
 
+    def _ready_runner(self, queue):
+        return mock.patch.object(
+            queue.jobs,
+            "validate_platform_runner",
+            return_value=(Path("/tmp/fake-sologsb.py"), Path("/tmp/queue_worker.py"), [self.root]),
+        )
+
     def test_claim_reserves_one_slot_per_candidate(self):
         queue = self._queue()
         queue.add_platform({"code": "gb-7", "name": "示例", "variantId": "v1",
                             "quotaBefore": {"remaining": 3}})
-        with mock.patch.object(queue.jobs, "start_platform", return_value={"pid": 1234}):
+        with self._ready_runner(queue), mock.patch.object(queue.jobs, "start_platform", return_value={"pid": 1234}):
             queue.tick()
         markers = queue._items[0].get("slotMarkers") or []
         self.assertEqual(len(markers), self.config["automation"]["candidatesPerTask"])
@@ -358,13 +365,13 @@ class SlotLifecycleTests(SchedulerTestCase):
         queue = self._queue()
         item = queue.add_platform({"code": "gb-7", "name": "示例", "variantId": "v1"})
 
-        queue.tick()
+        with self._ready_runner(queue), mock.patch.object(
+            queue.jobs, "start_platform", side_effect=MonitorError("启动失败")
+        ):
+            queue.tick()
         self.assertEqual(item["status"], "pending")
         self.assertEqual(item["slotMarkers"], [])
         self.assertFalse(item["capacityHeld"])
-        self.assertEqual(queue.slots.snapshot()["occupiedCount"], 0)
-
-        queue.tick()
         self.assertEqual(queue.slots.snapshot()["occupiedCount"], 0)
 
     def test_reserve_batch_replaces_old_markers_for_the_same_item(self):
@@ -437,7 +444,7 @@ class SlotLifecycleTests(SchedulerTestCase):
     def test_containers_appearing_releases_the_placeholders(self):
         queue = self._queue()
         queue.add_platform({"code": "gb-7", "name": "示例", "variantId": "v1"})
-        with mock.patch.object(queue.jobs, "start_platform", return_value={"pid": 1234}):
+        with self._ready_runner(queue), mock.patch.object(queue.jobs, "start_platform", return_value={"pid": 1234}):
             queue.tick()
         self.assertTrue(queue._items[0]["slotMarkers"])
         task_root = self.root / "tasks" / "gb-7-20260920-120000-abc"
@@ -453,7 +460,7 @@ class SlotLifecycleTests(SchedulerTestCase):
     def test_release_for_item_clears_every_marker(self):
         queue = self._queue()
         queue.add_platform({"code": "gb-7", "name": "示例", "variantId": "v1"})
-        with mock.patch.object(queue.jobs, "start_platform", return_value={"pid": 1234}):
+        with self._ready_runner(queue), mock.patch.object(queue.jobs, "start_platform", return_value={"pid": 1234}):
             queue.tick()
         item_id = queue._items[0]["id"]
         self.assertTrue(queue.slots.release_for_item(item_id))
@@ -503,6 +510,34 @@ class QuotaLedgerTests(SchedulerTestCase):
         self.assertEqual(quota["usageCountAfter"], 4)
         self.assertNotIn("remainingAfter", quota)
         self.assertEqual(platform.deducted, [("v-9", "0-1代码生成")])
+
+    def test_runner_preflight_blocks_before_quota_claim(self):
+        platform = self._Platform()
+        queue = self._queue_with_item()
+
+        queue.tick(platform=platform)
+
+        self.assertEqual(platform.deducted, [])
+        self.assertEqual(queue._items[0]["quota"]["state"], "pending")
+        self.assertIn("找不到 sologsb CLI", queue._items[0]["error"])
+
+    def test_item_level_start_failure_refunds_the_claim(self):
+        platform = self._Platform()
+        queue = self._queue_with_item()
+
+        with mock.patch.object(
+            queue.jobs,
+            "validate_platform_runner",
+            return_value=(Path("/tmp/fake-sologsb.py"), Path("/tmp/queue_worker.py"), [self.root]),
+        ), mock.patch.object(queue.jobs, "start_platform", side_effect=MonitorError("worker 启动失败")):
+            queue.tick(platform=platform)
+
+        quota = queue._items[0]["quota"]
+        self.assertEqual(platform.deducted, [("v-9", "0-1代码生成")])
+        self.assertEqual(platform.released, ["task-42"])
+        self.assertEqual(quota["state"], "refunded")
+        self.assertEqual(quota["refundMode"], "platform")
+        self.assertEqual(queue._items[0]["status"], "failed")
 
     def test_settle_marks_the_attempt_consumed(self):
         queue = self._queue_with_item()

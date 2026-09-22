@@ -473,22 +473,12 @@ class JobManager:
         if not item_id:
             raise MonitorError("平台队列项缺少 id")
         key = f"platform:{item_id}"
+        script, worker, active_roots = self.validate_platform_runner()
         with self._lock:
             current = self._jobs.get(key)
             if current and current.get("status") == "running":
                 raise MonitorError(f"平台任务已在运行，PID={current.get('pid')}")
-            script = Path(str(self.config.get("skillScript") or DEFAULT_SKILL_SCRIPT)).expanduser().resolve()
-            worker = APP_DIR / "queue_worker.py"
-            if not script.is_file():
-                raise MonitorError(f"找不到 sologsb CLI：{script}")
-            if not worker.is_file():
-                raise MonitorError(f"找不到队列 worker：{worker}")
             push_helper = str((self.config.get("automation") or {}).get("codexQueuePush") or "").strip()
-            monitor_cfg = self.config.get("monitor") or {}
-            active_values = monitor_cfg.get("activeRoots") if "activeRoots" in monitor_cfg else self.config.get("roots") or [DEFAULT_ROOT]
-            active_roots = [Path(value).expanduser().resolve() for value in active_values or []]
-            if not active_roots:
-                raise MonitorError("未选择任何 Codex 任务目录，不能启动平台任务")
             bound_scope = Path(str(item.get("scopeRoot") or "")).expanduser().resolve() if str(item.get("scopeRoot") or "").strip() else None
             workdir = bound_scope if bound_scope in active_roots else active_roots[0]
             workdir.mkdir(parents=True, exist_ok=True)
@@ -593,6 +583,25 @@ class JobManager:
                 daemon=True,
             ).start()
             return copy.deepcopy(job)
+
+    def validate_platform_runner(self) -> tuple[Path, Path, list[Path]]:
+        """Validate static launch prerequisites without changing quota or slots."""
+        script = Path(str(self.config.get("skillScript") or DEFAULT_SKILL_SCRIPT)).expanduser().resolve()
+        worker = APP_DIR / "queue_worker.py"
+        if not script.is_file():
+            raise MonitorError(f"找不到 sologsb CLI：{script}")
+        if not worker.is_file():
+            raise MonitorError(f"找不到队列 worker：{worker}")
+        monitor_cfg = self.config.get("monitor") or {}
+        active_values = (
+            monitor_cfg.get("activeRoots")
+            if "activeRoots" in monitor_cfg
+            else self.config.get("roots") or [DEFAULT_ROOT]
+        )
+        active_roots = [Path(value).expanduser().resolve() for value in active_values or []]
+        if not active_roots:
+            raise MonitorError("未选择任何 Codex 任务目录，不能启动平台任务")
+        return script, worker, active_roots
 
     def _persist(self, job: dict[str, Any]) -> None:
         item_id = str(job.get("platformItemId") or "")
@@ -2475,6 +2484,23 @@ class QueueManager:
                         self._save()
                     return actions
 
+            try:
+                self.jobs.validate_platform_runner()
+            except MonitorError as exc:
+                changed = False
+                error = str(exc)
+                for item in self._items:
+                    if item.get("status") != "pending" or item.get("source") != "platform":
+                        continue
+                    if str(item.get("error") or "") == error:
+                        continue
+                    item["error"] = error
+                    item["containerWait"] = "执行器不可启动，修复后自动继续"
+                    changed = True
+                if changed:
+                    self._save()
+                    self._emit("warning", "queue.runner_unavailable", detail=error)
+                return actions
             for item in self._items:
                 if mode == SCHEDULE_MODE_TASKS:
                     if capacity_in_use >= capacity:
@@ -2530,8 +2556,17 @@ class QueueManager:
                         job = self.jobs.start_platform(item, reason="queue")
                     except (MonitorError, OSError) as exc:
                         self.slots.release_for_item(item_id)
+                        quota = self._quota_of(item)
+                        if str(quota.get("state") or "") == "claimed":
+                            self.refund_quota(item, platform, f"任务启动失败：{exc}")
+                            item.update({
+                                "status": "failed",
+                                "finishedAt": utc_now(),
+                                "nextAttemptAt": "",
+                            })
+                        else:
+                            item["status"] = "pending"
                         item.update({
-                            "status": "pending",
                             "claimedAt": "",
                             "startedAt": "",
                             "jobPid": "",
@@ -2540,6 +2575,7 @@ class QueueManager:
                             "slotMarkers": [],
                             "slotReservedAt": "",
                             "error": str(exc),
+                            "lastError": str(exc),
                         })
                         self._save()
                         self._emit("error", "queue.start_failed", taskId=str(item.get("id") or ""),

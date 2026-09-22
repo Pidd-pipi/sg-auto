@@ -784,6 +784,12 @@ class ContainerLedger:
         over-subscribing the key.  The marker names are placeholders; they are
         released as soon as the task's real containers show up in ``docker ps``.
         """
+        # A retry can leave older markers behind when a previous launch failed
+        # before a worker existed.  Keep this operation idempotent per queue
+        # item so every scheduler pass replaces, rather than accumulates,
+        # reservations for that item.
+        if item_id:
+            self.release_for_item(item_id)
         markers: list[str] = []
         for index in range(max(1, int(count))):
             marker = self.reserve(
@@ -2523,10 +2529,16 @@ class QueueManager:
                     try:
                         job = self.jobs.start_platform(item, reason="queue")
                     except (MonitorError, OSError) as exc:
+                        self.slots.release_for_item(item_id)
                         item.update({
                             "status": "pending",
                             "claimedAt": "",
+                            "startedAt": "",
+                            "jobPid": "",
                             "capacityHeld": False,
+                            "orphaned": False,
+                            "slotMarkers": [],
+                            "slotReservedAt": "",
                             "error": str(exc),
                         })
                         self._save()
@@ -2709,6 +2721,7 @@ class ReconcileLoop:
     def run_once(self) -> list[dict[str, Any]]:
         actions: list[dict[str, Any]] = []
         actions.extend(self._sweep_dead_markers())
+        actions.extend(self._release_inactive_reservations())
         actions.extend(self._release_stale_reservations())
         actions.extend(self._release_terminal_containers())
         actions.extend(self._release_stuck_orphans())
@@ -2727,6 +2740,56 @@ class ReconcileLoop:
             return []
         self._emit("reconcile.dead_markers", detail=f"清理失效槽位标记 {len(removed)} 个", count=len(removed))
         return [{"kind": "dead-markers", "paths": removed}]
+
+    def _release_inactive_reservations(self) -> list[dict[str, Any]]:
+        """Release live-PID reservations that no active queue item owns.
+
+        Older versions could leave markers behind when ``start_platform``
+        failed after reserving slots.  Those markers keep counting until the
+        scheduler process exits, so clean them up even while the queue is
+        paused or otherwise not launching new work.
+        """
+        removed: list[str] = []
+        with self.queue._lock:
+            items = {str(item.get("id") or ""): item for item in self.queue._items}
+            active_ids = {
+                item_id
+                for item_id, item in items.items()
+                if item_id and (
+                    str(item.get("status") or "") in QUEUE_ACTIVE_STATUSES
+                    or bool(item.get("capacityHeld"))
+                )
+            }
+            for path, data in self.queue.slots._read_markers():
+                item_id = str(data.get("itemId") or "")
+                # Executor-owned markers do not carry a queue item id.  Leave
+                # those to the executor/limiter; only clean monitor-owned
+                # reservations here.
+                if not item_id or item_id in active_ids:
+                    continue
+                path_text = str(path)
+                if not self.queue.slots.release(path):
+                    continue
+                removed.append(path_text)
+                item = items.get(item_id)
+                if item is None:
+                    continue
+                item["slotMarkers"] = [
+                    marker for marker in item.get("slotMarkers") or []
+                    if str(marker) != path_text
+                ]
+                if not item["slotMarkers"]:
+                    item["slotReservedAt"] = ""
+            if removed:
+                self.queue._save()
+        if not removed:
+            return []
+        self._emit(
+            "reconcile.inactive_reservations",
+            detail=f"清理无活动队列项的槽位标记 {len(removed)} 个",
+            count=len(removed),
+        )
+        return [{"kind": "inactive-reservations", "paths": removed}]
 
     def _release_stale_reservations(self) -> list[dict[str, Any]]:
         """A claimed slot with no container after the reserve window."""

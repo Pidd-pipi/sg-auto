@@ -5,6 +5,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 APP = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP))
@@ -341,7 +342,8 @@ class SlotLifecycleTests(SchedulerTestCase):
         queue = self._queue()
         queue.add_platform({"code": "gb-7", "name": "示例", "variantId": "v1",
                             "quotaBefore": {"remaining": 3}})
-        queue.tick()
+        with mock.patch.object(queue.jobs, "start_platform", return_value={"pid": 1234}):
+            queue.tick()
         markers = queue._items[0].get("slotMarkers") or []
         self.assertEqual(len(markers), self.config["automation"]["candidatesPerTask"])
         self.assertEqual(queue.slots.snapshot()["occupiedCount"], len(markers))
@@ -352,10 +354,77 @@ class SlotLifecycleTests(SchedulerTestCase):
         self.assertIn("pid", data)
         self.assertIn("createdAt", data)
 
+    def test_failed_start_releases_its_reservations(self):
+        queue = self._queue()
+        item = queue.add_platform({"code": "gb-7", "name": "示例", "variantId": "v1"})
+
+        queue.tick()
+        self.assertEqual(item["status"], "pending")
+        self.assertEqual(item["slotMarkers"], [])
+        self.assertFalse(item["capacityHeld"])
+        self.assertEqual(queue.slots.snapshot()["occupiedCount"], 0)
+
+        queue.tick()
+        self.assertEqual(queue.slots.snapshot()["occupiedCount"], 0)
+
+    def test_reserve_batch_replaces_old_markers_for_the_same_item(self):
+        queue = self._queue()
+        first = queue.slots.reserve_batch(
+            count=2,
+            container_prefix="sologsb-gb-7",
+            project_code="gb-7",
+            item_id="platform-7",
+        )
+        second = queue.slots.reserve_batch(
+            count=2,
+            container_prefix="sologsb-gb-7",
+            project_code="gb-7",
+            item_id="platform-7",
+        )
+
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 2)
+        self.assertTrue(set(first).isdisjoint(second))
+        self.assertEqual(queue.slots.snapshot()["occupiedCount"], 2)
+
+    def test_reconcile_releases_markers_for_inactive_items(self):
+        queue = build_queue(self.config, items=[platform_item(status="pending")])
+        markers = queue.slots.reserve_batch(
+            count=2,
+            container_prefix="sologsb-gb-1",
+            project_code="gb-1",
+            item_id="platform-1",
+        )
+        queue._items[0]["slotMarkers"] = markers
+        queue._items[0]["slotReservedAt"] = "2026-09-20T00:00:00Z"
+        queue._save()
+
+        loop = ReconcileLoop(queue, queue.jobs, log=None, platform=None)
+        actions = loop.run_once()
+
+        self.assertTrue(any(action["kind"] == "inactive-reservations" for action in actions))
+        self.assertEqual(queue._items[0]["slotMarkers"], [])
+        self.assertEqual(queue._items[0]["slotReservedAt"], "")
+        self.assertEqual(queue.slots.snapshot()["occupiedCount"], 0)
+
+    def test_reconcile_does_not_remove_executor_owned_markers(self):
+        queue = self._queue()
+        marker = queue.slots.reserve(
+            container="sologsb-gb-1-candidate-1",
+            project_code="gb-1",
+        )
+        self.assertIsNotNone(marker)
+
+        loop = ReconcileLoop(queue, queue.jobs, log=None, platform=None)
+        loop.run_once()
+
+        self.assertEqual(queue.slots.snapshot()["occupiedCount"], 1)
+
     def test_containers_appearing_releases_the_placeholders(self):
         queue = self._queue()
         queue.add_platform({"code": "gb-7", "name": "示例", "variantId": "v1"})
-        queue.tick()
+        with mock.patch.object(queue.jobs, "start_platform", return_value={"pid": 1234}):
+            queue.tick()
         self.assertTrue(queue._items[0]["slotMarkers"])
         task_root = self.root / "tasks" / "gb-7-20260920-120000-abc"
         task_root.mkdir(parents=True, exist_ok=True)
@@ -370,7 +439,8 @@ class SlotLifecycleTests(SchedulerTestCase):
     def test_release_for_item_clears_every_marker(self):
         queue = self._queue()
         queue.add_platform({"code": "gb-7", "name": "示例", "variantId": "v1"})
-        queue.tick()
+        with mock.patch.object(queue.jobs, "start_platform", return_value={"pid": 1234}):
+            queue.tick()
         item_id = queue._items[0]["id"]
         self.assertTrue(queue.slots.release_for_item(item_id))
         self.assertEqual(queue.slots.snapshot()["occupiedCount"], 0)

@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>调度日志 · sologsb 调度台</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="rail">
+    <div class="rail-brand">
+      <div class="rail-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+      <div class="rail-brand-text">
+        <p>sologsb</p>
+        <h1>调度台</h1>
+      </div>
+    </div>
+    <nav class="rail-nav">
+      <a href="/">监看<span class="count" id="navTasks">0</span></a>
+      <a href="/tasks">队列<span class="count" id="navQueue">0</span></a>
+      <a href="/settings">设置</a>
+      <a href="/logs" class="active">日志</a>
+    </nav>
+    <div class="rail-section">
+      <span class="rail-label">默认文件夹</span>
+      <select class="input" id="folderSelect"></select>
+      <span class="rail-label">调度模式</span>
+      <button class="mode-toggle" id="modeBadge" type="button" data-mode="containers"><span class="dot"></span>容器优先</button>
+    </div>
+    <div class="rail-foot">
+      <button class="btn ghost sm" id="themeBtn" type="button">切换主题</button>
+      <div class="sync" id="sync"><span class="dot"></span><span id="syncText">连接中</span></div>
+      <div class="link" id="folderPath"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="head">
+      <div class="head-title">调度日志<small id="headMeta"></small></div>
+      <div class="head-spacer"></div>
+      <div class="head-tools">
+        <button class="btn ghost" id="clearBtn" type="button">清空视图</button>
+      </div>
+    </header>
+
+    <div class="band" id="band"></div>
+
+    <div class="filters">
+      <div class="segmented" id="levelRow">
+        <button type="button" data-level="" class="active">全部</button>
+        <button type="button" data-level="info">info</button>
+        <button type="button" data-level="warning">warning</button>
+        <button type="button" data-level="error">error</button>
+        <button type="button" data-level="debug">debug</button>
+      </div>
+      <input class="input search" id="searchInput" type="search" placeholder="搜索事件 / 项目编号 / 详情" autocomplete="off">
+      <label class="switch"><input type="checkbox" id="followToggle" checked><span class="track"></span>自动滚动</label>
+      <span class="cell" id="logMeta"></span>
+    </div>
+
+    <div style="padding:16px 20px 40px">
+      <div class="logtable" id="logTable"></div>
+      <div class="empty" id="emptyState" hidden>还没有调度事件。</div>
+    </div>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+<script>
+  const { $, $$, esc, debounce, fetchJson, postJson, fmtTime, toast,
+          initTheme, renderRail, renderMetrics, connectStream, setText, setHtml, setAttr } = window.SoloApp;
+
+  const state = { entries: [], lastSeq: 0, query: "", level: "", follow: true, connected: false, error: "", snapshot: null };
+  initTheme();
+
+  function matches(entry) {
+    if (state.level && String(entry.level || "") !== state.level) return false;
+    if (!state.query) return true;
+    const hay = [entry.event, entry.projectCode, entry.taskId,
+      typeof entry.detail === "string" ? entry.detail : JSON.stringify(entry.detail || "")].join(" ").toLowerCase();
+    return hay.includes(state.query);
+  }
+
+  function renderRow(node, entry) {
+    let changed = false;
+    changed = setAttr(node, "data-seq", entry.seq) || changed;
+    if (node.dataset.built !== "1") {
+      node.className = "logrow";
+      node.innerHTML = `<span class="ts"></span><span class="lv"></span><span class="ev"></span><span class="dt"></span>`;
+      node.dataset.built = "1";
+    }
+    const [ts, lv, ev, dt] = $$(".ts, .lv, .ev, .dt", node);
+    changed = setText(ts, fmtTime(entry.ts)) || changed;
+    changed = setText(lv, entry.level) || changed;
+    lv.className = `lv ${String(entry.level)}`;
+    changed = setText(ev, `${entry.event}${entry.projectCode ? ` · ${entry.projectCode}` : ""}`) || changed;
+    const text = typeof entry.detail === "string" ? entry.detail : JSON.stringify(entry.detail ?? "");
+    changed = setText(dt, text) || changed;
+    return changed;
+  }
+
+  function render() {
+    const table = $("#logTable");
+    const rows = visible();
+    // Newest first, and only ever keep the newest 600 in the DOM.
+    const ordered = [...rows].reverse();
+    renderKeyed(table, ordered.slice(0, 600), renderRow, (entry) => String(entry.seq));
+    $("#emptyState").hidden = rows.length > 0;
+    table.hidden = rows.length === 0;
+    setText($("#logMeta"), `${rows.length} 条 · 最新 seq ${state.lastSeq}`);
+  }
+
+  function visible() {
+    return state.entries.filter(matches);
+  }
+
+  function append(entries) {
+    if (!entries.length) return;
+    state.entries = [...state.entries, ...entries];
+    if (state.entries.length > 4000) state.entries = state.entries.slice(-4000);
+    state.lastSeq = Math.max(state.lastSeq, Number(entries[entries.length - 1].seq) || 0);
+    render();
+  }
+
+  $("#levelRow").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-level]");
+    if (!button) return;
+    state.level = button.dataset.level;
+    $$("#levelRow button").forEach((node) => node.classList.toggle("active", node === button));
+    render();
+  });
+  $("#searchInput").addEventListener("input", debounce((event) => {
+    state.query = event.target.value.trim().toLowerCase();
+    render();
+  }, 150));
+  $("#followToggle").addEventListener("change", (event) => { state.follow = event.target.checked; });
+  $("#clearBtn").addEventListener("click", () => { state.entries = []; render(); });
+
+  async function setMode(mode) {
+    try {
+      await postJson("/api/automation", { action: "set-schedule-mode", mode });
+      toast(`调度模式已切换为 ${mode === "containers" ? "容器优先" : "任务数量优先"}`);
+    } catch (error) {
+      toast(`切换失败：${error.message}`, true);
+    }
+  }
+  $("#modeBadge").addEventListener("click", async () => {
+    const current = ((state.snapshot || {}).queue || {}).scheduleMode || "containers";
+    await setMode(current === "containers" ? "tasks" : "containers");
+  });
+  $("#folderSelect").addEventListener("change", async (event) => {
+    try {
+      await postJson("/api/settings", { settings: { defaultFolderId: event.target.value } });
+      toast("默认文件夹已更新");
+    } catch (error) {
+      toast(`保存失败：${error.message}`, true);
+    }
+  });
+
+  function applySnapshot(payload) {
+    state.snapshot = payload;
+    renderRail({ ...payload, connected: state.connected, error: state.error });
+    renderMetrics(payload);
+  }
+
+  connectStream({
+    onSnapshot: applySnapshot,
+    onTasks: (payload) => {
+      if (!state.snapshot) return;
+      if (payload.queue) state.snapshot.queue = payload.queue;
+      if (payload.summary) state.snapshot.summary = payload.summary;
+      if (payload.containers) state.snapshot.containers = payload.containers;
+      renderRail({ ...state.snapshot, connected: state.connected, error: state.error });
+      renderMetrics(state.snapshot);
+    },
+    onLog: (payload) => append(payload.entries || []),
+    onStatus: ({ connected, error }) => {
+      state.connected = connected;
+      state.error = error;
+      if (state.snapshot) renderRail({ ...state.snapshot, connected, error });
+    },
+  });
+
+  fetchJson("/api/logs?limit=300").then((data) => {
+    const entries = (data.entries && data.entries.length ? data.entries : data.recent) || [];
+    append([...entries].reverse());
+  }).catch((error) => toast(`读取日志失败：${error.message}`, true));
+  fetchJson("/api/snapshot").then(applySnapshot).catch(() => {});
+</script>
+</body>
+</html>

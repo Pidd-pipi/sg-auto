@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.state/
+*.log
+.playwright-cli/
+.ruff_cache/
+.DS_Store
+scheduler.jsonl*
+.pytest_cache/
+
+# Local editor settings
+.claude/settings.local.json

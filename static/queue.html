@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>任务队列 · sologsb 调度台</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="rail">
+    <div class="rail-brand">
+      <div class="rail-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+      <div class="rail-brand-text">
+        <p>sologsb</p>
+        <h1>调度台</h1>
+      </div>
+    </div>
+    <nav class="rail-nav">
+      <a href="/">监看<span class="count" id="navTasks">0</span></a>
+      <a href="/tasks" class="active">队列<span class="count" id="navQueue">0</span></a>
+      <a href="/settings">设置</a>
+      <a href="/logs">日志</a>
+    </nav>
+    <div class="rail-section">
+      <span class="rail-label">默认文件夹</span>
+      <select class="input" id="folderSelect"></select>
+      <span class="rail-label">调度模式</span>
+      <button class="mode-toggle" id="modeBadge" type="button" data-mode="containers"><span class="dot"></span>容器优先</button>
+    </div>
+    <div class="rail-foot">
+      <button class="btn ghost sm" id="themeBtn" type="button">切换主题</button>
+      <div class="sync" id="sync"><span class="dot"></span><span id="syncText">连接中</span></div>
+      <div class="link" id="folderPath"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="head">
+      <div class="head-title">任务队列<small id="headMeta"></small></div>
+      <div class="head-spacer"></div>
+      <div class="head-tools">
+        <button class="btn primary" id="togglePausedBtn" type="button">启动队列</button>
+        <button class="btn ghost" id="clearFinishedBtn" type="button">清理结束项</button>
+      </div>
+    </header>
+
+    <div class="band" id="band"></div>
+
+    <div class="filters">
+      <input class="input search" id="projectSearch" type="search" placeholder="搜索项目编号 / 名称" autocomplete="off">
+      <select class="input" id="taskTypeSelect" style="max-width:150px">
+        <option value="0-1代码生成">0-1 代码生成</option>
+        <option value="feature迭代">feature 迭代</option>
+      </select>
+      <select class="input" id="difficultySelect" style="max-width:100px">
+        <option>困难</option>
+        <option>地狱</option>
+      </select>
+      <label class="switch" title="关闭时仅使用我的项目；打开后同时使用项目池">
+        <input type="checkbox" id="poolToggle" role="switch"><span class="track"></span>包含项目池
+      </label>
+      <button class="btn" id="randomBtn" type="button">随机选择</button>
+      <button class="btn primary" id="addBtn" type="button" disabled>加入队列</button>
+      <button class="btn ghost" id="reloadProjectsBtn" type="button">刷新项目</button>
+    </div>
+
+    <div style="padding:16px 20px 40px">
+      <div class="panel">
+        <div class="panel-head"><h3>Solo Manager 项目</h3><span id="platformMeta">读取中…</span></div>
+        <div class="items" id="projectList"></div>
+      </div>
+
+      <div class="cols" style="margin-top:14px">
+        <section>
+          <div class="panel">
+            <div class="panel-head"><h3>执行队列</h3><span id="queueMeta"></span></div>
+            <div class="items" id="queueList"></div>
+          </div>
+
+        </section>
+
+        <section>
+          <div class="panel">
+            <div class="panel-head"><h3>调度模式与上限</h3><span id="modeMeta"></span></div>
+            <div class="panel-body grid grid-2">
+              <div class="field">
+                <label>模式</label>
+                <select class="input" id="modeSelect">
+                  <option value="containers">容器优先</option>
+                  <option value="tasks">任务数量优先</option>
+                </select>
+                <span class="hint">容器优先保持运行中的候选容器数等于设定值；任务数量优先保持并行任务数等于设定值。</span>
+              </div>
+              <div class="field"><label>最大任务数 maxTasks</label><input class="input" id="maxTasksInput" type="number" min="1" max="20"></div>
+              <div class="field"><label>最大容器数 maxContainers</label><input class="input" id="maxContainersInput" type="number" min="1" max="20"></div>
+              <div class="field"><label>单任务备选容器 candidatesPerTask</label><input class="input" id="candidatesInput" type="number" min="1" max="8"></div>
+              <div class="field"><label>补位阈值 containerRefillBelow</label><input class="input" id="refillInput" type="number" min="1" max="20"></div>
+              <div class="field"><label>启动超时 startupTimeout（秒）</label><input class="input" id="startupTimeoutInput" type="number" min="300" max="600" step="30"></div>
+              <div class="field"><label>容器预占位 containerReserve（秒）</label><input class="input" id="reserveInput" type="number" min="300" max="600" step="30"></div>
+              <div class="field"><label>纠错周期 reconcile（秒）</label><input class="input" id="reconcileInput" type="number" min="15" max="3600" step="15"></div>
+            </div>
+            <div class="panel-body" style="border-top:1px solid var(--line)">
+              <div class="row-inline">
+                <button class="btn primary" id="saveLimitsBtn" type="button">应用上限</button>
+                <span class="cell" id="limitsHint"></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h3>已禁用项目</h3><span id="disabledMeta"></span></div>
+            <div class="items" id="disabledList"></div>
+            <div class="panel-body" style="border-top:1px solid var(--line)">
+              <p class="hint">禁用的项目会从项目选择器和自动补队中移除，不会再次入队。</p>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h3>自动补队</h3><span id="refillMeta"></span></div>
+            <div class="panel-body grid grid-2">
+              <div class="field"><label>任务冷却（秒）</label>
+                <div class="row-inline">
+                  <input class="input" id="cooldownInput" type="number" min="0" max="86400">
+                  <button class="btn" id="saveCooldownBtn" type="button">应用</button>
+                </div>
+              </div>
+              <div class="field"><label>迭代占比（%）</label>
+                <div class="row-inline">
+                  <input class="input" id="weightInput" type="number" min="0" max="100">
+                  <button class="btn" id="saveWeightBtn" type="button">应用</button>
+                </div>
+              </div>
+            </div>
+            <div class="panel-body" style="border-top:1px solid var(--line)">
+              <p class="hint" id="weightHint"></p>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h3>占用概览</h3><span id="usageMeta"></span></div>
+            <div class="tiles" id="usageTiles"></div>
+          </div>
+
+          <details class="panel">
+            <summary class="panel-head" style="cursor:pointer;border-bottom:0">
+              <h3>触发 Prompt 模板</h3><span id="templateCount"></span>
+            </summary>
+            <div class="panel-body" style="border-top:1px solid var(--line)">
+              <textarea id="promptTemplate" spellcheck="false"></textarea>
+              <div class="row-inline" style="margin-top:8px">
+                <button class="btn primary" id="saveTemplateBtn" type="button">保存模板</button>
+                <span class="hint">保存后用于后续入队；加入队列前会自动保存未保存修改。</span>
+              </div>
+            </div>
+          </details>
+        </section>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+<script>
+  const { $, $$, esc, debounce, fetchJson, postJson, fmtClock, fmtDuration, toast,
+          initTheme, renderRail, renderMetrics, connectStream, renderKeyed, setText, setHtml, setAttr } = window.SoloApp;
+
+  const STATUS_LABELS = { pending: "待执行", launching: "启动中", running: "执行中", triggered: "已触发",
+    orphaned: "状态待确认", done: "已完成", failed: "失败", skipped: "已跳过" };
+  const QUOTA_LABELS = { pending: "配额待扣", claimed: "已预扣", settled: "已结算", refunded: "已回补", superseded: "执行器已接管" };
+
+  const state = { snapshot: null, projects: [], selected: null, query: "", templateDirty: false, connected: false, error: "" };
+  initTheme();
+
+  /* ------------------------------------------------------------------ queue */
+  function renderQueueItem(node, item) {
+    let changed = false;
+    changed = setAttr(node, "data-id", item.id) || changed;
+    if (node.dataset.built !== "1") {
+      node.className = "item";
+      node.innerHTML = `<div class="item-top">
+          <div style="min-width:0">
+            <div class="item-name"></div>
+            <div class="item-sub"></div>
+          </div>
+          <div class="item-tools"></div>
+        </div>`;
+      node.dataset.built = "1";
+    }
+    const [name, sub, tools] = $$(".item-name, .item-sub, .item-tools", node);
+    changed = setText(name, item.taskName || item.projectCode || item.id) || changed;
+    const quota = item.quota || {};
+    const tags = [
+      item.source === "platform" ? "Solo Manager" : "本地任务",
+      item.source === "platform" ? String(item.side || "both").toUpperCase() : "",
+      item.projectCode || "",
+      item.attempts ? `尝试 ${item.attempts}` : "",
+      item.triggerPromptLength ? `Prompt ${item.triggerPromptLength} 字` : "",
+    ].filter(Boolean).join(" · ");
+    changed = setHtml(sub, `${esc(tags)}<br><span class="st ${esc(item.status)}">${esc(STATUS_LABELS[item.status] || item.status)}</span>`
+      + `${quota.state ? ` <span class="pill" data-state="${esc(quota.state)}" title="${esc(quota.refundReason || "")}">${esc(QUOTA_LABELS[quota.state] || quota.state)}</span>` : ""}`
+      + `${item.slotMarkers && item.slotMarkers.length ? ` <span class="pill" data-state="claimed" title="已占用容器槽位">占槽 ${item.slotMarkers.length}</span>` : ""}`
+      + `${item.notice || item.error ? `<br>${esc(item.notice || item.error)}` : ""}`) || changed;
+
+    const active = ["launching", "running", "triggered", "orphaned"].includes(item.status) || item.capacityHeld;
+    const buttons = [];
+    if (item.status === "orphaned" || (item.capacityHeld && ["failed", "skipped"].includes(item.status))) {
+      buttons.push(`<button class="btn sm" data-q="release" data-id="${esc(item.id)}">释放名额</button>`);
+    }
+    if (!item.capacityHeld && ["failed", "skipped"].includes(item.status)) {
+      buttons.push(`<button class="btn sm" data-q="retry" data-id="${esc(item.id)}">重试</button>`);
+    }
+    if (item.triggerPromptLength) {
+      buttons.push(`<button class="btn ghost sm" data-q="prompt" data-id="${esc(item.id)}">Prompt</button>`);
+    }
+    buttons.push(`<button class="btn ghost sm" data-q="disable" data-id="${esc(item.id)}" data-code="${esc(item.projectCode || "")}">禁用</button>`);
+    buttons.push(`<button class="btn ghost sm" data-q="remove" data-id="${esc(item.id)}" ${active ? "disabled" : ""}>删除</button>`);
+    changed = setHtml(tools, buttons.join("")) || changed;
+    return changed;
+  }
+
+  function renderQueue() {
+    const queue = (state.snapshot || {}).queue || {};
+    const items = queue.items || [];
+    const container = $("#queueList");
+    if (!items.length) {
+      setHtml(container, `<div class="empty">队列为空。从上方 Solo Manager 项目中选择加入。</div>`);
+    } else {
+      renderKeyed(container, items, renderQueueItem, (item) => item.id);
+    }
+    const counts = queue.counts || {};
+    setText($("#queueMeta"), `${counts.pending || 0} 待执行 · ${counts.running || 0} 活跃 · ${counts.done || 0} 完成 · ${counts.failed || 0} 失败 · ${counts.skipped || 0} 跳过`);
+    const paused = Boolean(queue.paused);
+    setText($("#togglePausedBtn"), paused ? "启动队列" : "暂停队列");
+    $("#togglePausedBtn").classList.toggle("primary", paused);
+    setHtml($("#usageTiles"), [
+      ["队列占用", counts.running || 0],
+      ["并发上限", queue.maxTasks || 0],
+      ["运行容器", counts.nonTestContainerCount || 0],
+      ["预计容器", counts.estimatedNonTestContainers || 0],
+      ["启动预留", counts.startupReservations || 0],
+      ["配额已扣", counts.quotaClaimed || 0],
+      ["配额回补", counts.quotaRefunded || 0],
+    ].map(([label, value]) => `<div class="tile"><b>${esc(value)}</b><span>${esc(label)}</span></div>`).join(""));
+    const containers = state.snapshot.containers || {};
+    setText($("#usageMeta"), `Docker ${containers.dockerReady ? "可用" : "不可用"} · 预占位 ${containers.reserved ?? 0}`);
+    setText($("#limitsHint"), `启动超时 ${queue.startupTimeoutSeconds || 0}s · 预占位 ${queue.containerReserveSeconds || 0}s`);
+    setText($("#modeMeta"), queue.scheduleMode === "containers"
+      ? `容器优先 · 硬上限 ${queue.maxContainers} · 补位阈值 ${queue.containerRefillBelow}`
+      : `任务数量优先 · 并发上限 ${queue.maxTasks}`);
+  }
+
+  /* ------------------------------------------------------------------ roots */
+  /* --------------------------------------------------------------- projects */
+  function renderProjects() {
+    const pool = $("#poolToggle").checked;
+    const query = state.query.trim().toLowerCase();
+    const queued = new Set(((state.snapshot || {}).queue || {}).items || []
+      .map((item) => String(item.projectCode || "").toLowerCase()));
+    const items = state.projects
+      .filter((item) => pool || item.stage === "我的项目")
+      .filter((item) => !queued.has(String(item.code || "").toLowerCase()))
+      .filter((item) => !query || [item.code, item.name, item.businessDomain, item.category].join(" ").toLowerCase().includes(query));
+    setText($("#platformMeta"), `${items.length} 个可用 · ${pool ? "我的项目 + 项目池" : "仅我的项目"}`);
+    setHtml($("#projectList"), items.slice(0, 120).map((item) => `
+      <div class="item" data-project="${esc(item.code)}" style="cursor:pointer${state.selected && state.selected.code === item.code ? ";background:var(--surface-2)" : ""}">
+        <div class="item-top">
+          <div style="min-width:0">
+            <div class="item-name">${esc(item.code)} · ${esc(item.name)}</div>
+            <div class="item-sub">${esc(item.businessDomain || "-")} · 剩余 ${esc((item.quotaBefore || {}).remaining ?? 0)} · ${esc(item.category || "-")}</div>
+          </div>
+          <span class="pill" data-state="${item.stage === "我的项目" ? "settled" : "claimed"}">${esc(item.stage)}</span>
+        </div>
+      </div>`).join("") || `<div class="empty">没有匹配的项目。</div>`);
+    $("#addBtn").disabled = !state.selected;
+    $("#randomBtn").disabled = items.length === 0;
+  }
+
+  async function loadProjects(force = false) {
+    try {
+      const data = await fetchJson(
+        `/api/platform/projects?taskType=${encodeURIComponent($("#taskTypeSelect").value)}&refresh=${force ? "1" : "0"}`, {}, 20000);
+      state.projects = data.items || [];
+      state.selected = null;
+      renderProjects();
+      if (data.errors && data.errors.length) toast(`部分项目源失败：${data.errors[0]}`, true);
+    } catch (error) {
+      state.projects = [];
+      renderProjects();
+      toast(`读取项目失败：${error.message}`, true);
+    }
+  }
+
+  /* ---------------------------------------------------------------- disabled */
+  function renderDisabled() {
+    const items = (state.snapshot || {}).disabledProjects || [];
+    setText($("#disabledMeta"), `${items.length} 个项目`);
+    setHtml($("#disabledList"), items.map((item) => `
+      <div class="item">
+        <div class="item-top">
+          <div style="min-width:0">
+            <div class="item-name">${esc(item.code)}${item.name && item.name !== item.code ? ` · ${esc(item.name)}` : ""}</div>
+            <div class="item-sub">${esc(item.reason || "手动禁用")} · ${esc(item.at || "")}</div>
+          </div>
+          <div class="item-tools">
+            <button class="btn sm" data-enable="${esc(item.code)}">恢复</button>
+          </div>
+        </div>
+      </div>`).join("") || `<div class="empty">没有被禁用的项目。</div>`);
+  }
+
+  $("#disabledList").addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-enable]");
+    if (!button) return;
+    try {
+      await act("project-enable", { projectCode: button.dataset.enable });
+      state.snapshot.disabledProjects = (state.snapshot.disabledProjects || []).filter(
+        (item) => item.code !== button.dataset.enable);
+      renderDisabled();
+      renderProjects();
+      toast(`已恢复 ${button.dataset.enable}`);
+    } catch (error) {
+      toast(`恢复失败：${error.message}`, true);
+    }
+  });
+
+  /* ----------------------------------------------------------------- config */
+  function syncForm() {
+    const queue = (state.snapshot || {}).queue || {};
+    const set = (id, value) => { const node = $(id); if (node && document.activeElement !== node) node.value = String(value ?? ""); };
+    set("#maxTasksInput", queue.maxTasks);
+    set("#maxContainersInput", queue.maxContainers);
+    set("#candidatesInput", queue.candidatesPerTask);
+    set("#refillInput", queue.containerRefillBelow);
+    set("#startupTimeoutInput", queue.startupTimeoutSeconds);
+    set("#reserveInput", queue.containerReserveSeconds);
+    set("#reconcileInput", queue.reconcileSeconds);
+    set("#cooldownInput", queue.cooldownSeconds);
+    const weights = (queue.autoRefill || {}).taskTypeWeights || {};
+    set("#weightInput", weights["feature迭代"] ?? 80);
+    const mode = $("#modeSelect");
+    if (mode && document.activeElement !== mode) mode.value = queue.scheduleMode || "containers";
+    const pool = $("#poolToggle");
+    if (document.activeElement !== pool) pool.checked = Boolean(queue.mergeProjectPool);
+    const template = $("#promptTemplate");
+    if (template && !state.templateDirty) template.value = queue.promptTemplate || "";
+    setText($("#templateCount"), `${state.templateDirty ? "未保存 · " : ""}${(template.value || "").replace(/\s/g, "").length} 字`);
+    const target = (queue.autoRefill || {}).targetPending || 20;
+    const iteration = Number($("#weightInput").value || 0);
+    const count = Math.round(target * iteration / 100);
+    setText($("#weightHint"), `目标待执行 ${target} 条，约 ${count} 条迭代 / ${target - count} 条 0-1 代码生成。`);
+    setText($("#refillMeta"), `目标 ${target} · ${(queue.autoRefill || {}).enabled ? "已启用" : "未启用"}`);
+    setText($("#headMeta"), `${(queue.items || []).length} 项 · ${fmtClock(state.snapshot.generatedAt)}`);
+  }
+
+  async function act(action, payload = {}) {
+    const data = await postJson("/api/automation", { action, ...payload });
+    state.snapshot = { ...state.snapshot, queue: data.automation };
+    renderRail({ ...state.snapshot, connected: state.connected, error: state.error });
+    renderMetrics(state.snapshot);
+    renderQueue();
+    renderDisabled();
+    syncForm();
+    return data;
+  }
+
+  /* ------------------------------------------------------------------- wire */
+  $("#projectSearch").addEventListener("input", debounce((event) => { state.query = event.target.value; renderProjects(); }, 150));
+  $("#taskTypeSelect").addEventListener("change", () => loadProjects(true));
+  $("#poolToggle").addEventListener("change", async () => {
+    try { await act("set-merge-project-pool", { enabled: $("#poolToggle").checked }); renderProjects(); }
+    catch (error) { toast(`保存失败：${error.message}`, true); }
+  });
+  $("#projectList").addEventListener("click", (event) => {
+    const node = event.target.closest("[data-project]");
+    if (!node) return;
+    state.selected = state.projects.find((item) => item.code === node.dataset.project) || null;
+    renderProjects();
+  });
+  $("#randomBtn").addEventListener("click", () => {
+    const pool = $("#poolToggle").checked;
+    const query = state.query.trim().toLowerCase();
+    const items = state.projects
+      .filter((item) => pool || item.stage === "我的项目")
+      .filter((item) => !query || [item.code, item.name].join(" ").toLowerCase().includes(query));
+    if (!items.length) return toast("当前筛选下没有可用项目", true);
+    state.selected = items[Math.floor(Math.random() * items.length)];
+    renderProjects();
+    toast(`随机选中：${state.selected.code}`);
+  });
+  $("#reloadProjectsBtn").addEventListener("click", () => loadProjects(true));
+
+  $("#promptTemplate").addEventListener("input", () => { state.templateDirty = true; syncForm(); });
+  $("#saveTemplateBtn").addEventListener("click", async () => {
+    try {
+      await act("set-prompt-template", { template: $("#promptTemplate").value });
+      state.templateDirty = false;
+      toast("Prompt 模板已保存");
+    } catch (error) { toast(`保存失败：${error.message}`, true); }
+  });
+
+  $("#addBtn").addEventListener("click", async () => {
+    if (!state.selected) return toast("请先选择 Solo Manager 项目", true);
+    if (state.templateDirty) {
+      try { await act("set-prompt-template", { template: $("#promptTemplate").value }); state.templateDirty = false; }
+      catch (error) { return toast(`保存模板失败：${error.message}`, true); }
+    }
+    try {
+      await act("queue-add-platform", {
+        project: state.selected,
+        taskType: $("#taskTypeSelect").value,
+        difficulty: $("#difficultySelect").value,
+      });
+      toast(`已加入队列：${state.selected.code}`);
+      state.selected = null;
+      renderProjects();
+    } catch (error) { toast(`入队失败：${error.message}`, true); }
+  });
+
+  $("#queueList").addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-q]");
+    if (!button || button.disabled) return;
+    const { q, id } = button.dataset;
+    try {
+      if (q === "release") { await act("queue-release", { itemId: id }); toast("已释放并发名额"); }
+      else if (q === "retry") { await act("queue-retry", { itemId: id }); toast("已重新入队"); }
+      else if (q === "remove") { await act("queue-remove", { itemId: id }); }
+      else if (q === "disable") {
+        const code = button.dataset.code;
+        if (!code) return toast("该队列项没有项目编号，无法禁用", true);
+        if (!window.confirm(`禁用项目 ${code}？\n\n会从队列移除，并且不再自动补队。可在下方“已禁用项目”中恢复。`)) return;
+        await act("queue-disable", { itemId: id, projectCode: code });
+        state.snapshot.disabledProjects = [
+          ...((state.snapshot || {}).disabledProjects || []),
+          { code, name: code, reason: "手动禁用", at: new Date().toISOString() },
+        ];
+        renderDisabled();
+        renderProjects();
+        toast(`已禁用 ${code}`);
+      }
+      else if (q === "prompt") {
+        const data = await fetchJson(`/api/queue/${encodeURIComponent(id)}/prompt`);
+        if (!data.prompt) return toast("该队列项没有绑定 Prompt", true);
+        await navigator.clipboard.writeText(data.prompt);
+        toast("任务 Prompt 已复制");
+      }
+    } catch (error) { toast(`操作失败：${error.message}`, true); }
+  });
+
+  $("#togglePausedBtn").addEventListener("click", async () => {
+    const paused = !((state.snapshot.queue || {}).paused);
+    await act("set-paused", { paused });
+    toast(paused ? "队列已暂停" : "队列已启动");
+  });
+  $("#clearFinishedBtn").addEventListener("click", async () => { await act("queue-clear"); toast("已清理结束项"); });
+
+
+  async function setMode(mode) {
+    await act("set-schedule-mode", { mode });
+    toast(`调度模式已切换为 ${mode === "containers" ? "容器优先" : "任务数量优先"}`);
+  }
+  $("#modeSelect").addEventListener("change", (event) => setMode(event.target.value));
+  $("#modeBadge").addEventListener("click", async () => {
+    const current = ((state.snapshot.queue || {}).scheduleMode) || "containers";
+    await setMode(current === "containers" ? "tasks" : "containers");
+  });
+
+  $("#saveLimitsBtn").addEventListener("click", async () => {
+    try {
+      await act("set-limits", {
+        maxTasks: Number($("#maxTasksInput").value),
+        maxContainers: Number($("#maxContainersInput").value),
+        candidatesPerTask: Number($("#candidatesInput").value),
+        containerRefillBelow: Number($("#refillInput").value),
+        startupTimeoutSeconds: Number($("#startupTimeoutInput").value),
+        containerReserveSeconds: Number($("#reserveInput").value),
+        reconcileSeconds: Number($("#reconcileInput").value),
+      });
+      toast("上限参数已应用");
+    } catch (error) { toast(`应用失败：${error.message}`, true); }
+  });
+
+  $("#saveCooldownBtn").addEventListener("click", async () => {
+    await act("set-cooldown", { cooldownSeconds: Number($("#cooldownInput").value) });
+    toast("冷却时间已应用");
+  });
+  $("#weightInput").addEventListener("input", () => syncForm());
+  $("#saveWeightBtn").addEventListener("click", async () => {
+    const iteration = Number($("#weightInput").value);
+    if (!Number.isFinite(iteration) || iteration < 0 || iteration > 100) return toast("迭代占比必须在 0 到 100 之间", true);
+    const target = Math.max(1, Number(((state.snapshot.queue || {}).autoRefill || {}).targetPending || 20));
+    const count = Math.round(target * iteration / 100);
+    if (!window.confirm(`确认调整后续自动补队比例？\n\n迭代：${iteration}%（约 ${count} 条）\n0-1代码生成：${100 - iteration}%（约 ${target - count} 条）`)) return;
+    try {
+      await act("set-auto-refill-weights", { weights: { "feature迭代": iteration, "0-1代码生成": 100 - iteration } });
+      toast(`补队比例已调整为迭代 ${iteration}% / 0-1 ${100 - iteration}%`);
+    } catch (error) { toast(`应用失败：${error.message}`, true); }
+  });
+
+  $("#folderSelect").addEventListener("change", async (event) => {
+    try {
+      await postJson("/api/settings", { settings: { defaultFolderId: event.target.value } });
+      toast("默认文件夹已更新");
+      state.snapshot = await fetchJson("/api/snapshot");
+      renderRail({ ...state.snapshot, connected: state.connected, error: state.error });
+    } catch (error) {
+      toast(`保存文件夹失败：${error.message}`, true);
+      $("#folderSelect").dataset.loaded = "0";
+    }
+  });
+
+  function applySnapshot(payload) {
+    state.snapshot = payload;
+    renderRail({ ...payload, connected: state.connected, error: state.error });
+    renderMetrics(payload);
+    renderQueue();
+    renderDisabled();
+    syncForm();
+  }
+
+  function applyDelta(payload) {
+    if (!state.snapshot) return;
+    if (payload.queue) state.snapshot.queue = payload.queue;
+    if (payload.summary) state.snapshot.summary = payload.summary;
+    if (payload.containers) state.snapshot.containers = payload.containers;
+    state.snapshot.generatedAt = payload.generatedAt;
+    renderRail({ ...state.snapshot, connected: state.connected, error: state.error });
+    renderMetrics(state.snapshot);
+    renderQueue();
+    syncForm();
+  }
+
+  connectStream({
+    onSnapshot: applySnapshot,
+    onTasks: applyDelta,
+    onLog: () => {},
+    onStatus: ({ connected, error }) => {
+      state.connected = connected;
+      state.error = error;
+      if (state.snapshot) renderRail({ ...state.snapshot, connected, error });
+    },
+  });
+
+  fetchJson("/api/snapshot").then(applySnapshot).catch((error) => toast(`初始化失败：${error.message}`, true));
+  loadProjects();
+</script>
+</body>
+</html>

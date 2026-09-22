@@ -211,7 +211,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if candidate.suffix in IMMUTABLE_SUFFIXES:
             cache = "public, max-age=31536000, immutable"
-        elif candidate.suffix == ".html":
+        elif candidate.suffix in {".html", ".css", ".js"}:
             cache = "no-cache"
         else:
             cache = "public, max-age=300"

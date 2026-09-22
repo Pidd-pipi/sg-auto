@@ -414,7 +414,10 @@ class QuotaLedgerTests(SchedulerTestCase):
         self.assertEqual(quota["platformTaskId"], "task-42")
         self.assertEqual(quota["platformTaskNo"], "gb-9-代码生成-1")
         self.assertEqual(quota["remainingBefore"], 5)
-        self.assertEqual(quota["remainingAfter"], 4)
+        # The create response reports cumulative usage, not remaining quota —
+        # see the note in claim_quota.
+        self.assertEqual(quota["usageCountAfter"], 4)
+        self.assertNotIn("remainingAfter", quota)
         self.assertEqual(platform.deducted, [("v-9", "0-1代码生成")])
 
     def test_settle_marks_the_attempt_consumed(self):
@@ -523,6 +526,30 @@ class BlocklistTests(SchedulerTestCase):
         queue.blocked_codes = {"gb-other"}
         item = queue.add_platform({"code": "gb-9", "name": "示例", "variantId": "v1"})
         self.assertEqual(item["projectCode"], "gb-9")
+
+
+class RefillThresholdTests(SchedulerTestCase):
+    """containerRefillBelow is only meaningful below the hard limit."""
+
+    def _queue(self, **cfg):
+        config = make_config(self.root)
+        config["automation"].update(cfg)
+        return build_queue(config)
+
+    def test_threshold_above_the_hard_limit_is_clamped(self):
+        queue = self._queue(maxContainers=4, containerRefillBelow=5)
+        self.assertEqual(queue._max_containers_limit(), 4)
+        self.assertEqual(queue.effective_refill_below(), 4)
+
+    def test_threshold_below_the_hard_limit_is_kept(self):
+        queue = self._queue(maxContainers=6, containerRefillBelow=3)
+        self.assertEqual(queue.effective_refill_below(), 3)
+
+    def test_snapshot_reports_both_configured_and_effective(self):
+        queue = self._queue(maxContainers=4, containerRefillBelow=9)
+        snapshot = queue.snapshot()
+        self.assertEqual(snapshot["containerRefillBelow"], 4)
+        self.assertEqual(snapshot["containerRefillBelowConfigured"], 9)
 
 
 class ScheduleModeTests(SchedulerTestCase):

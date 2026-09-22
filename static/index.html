@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>任务监看 · sologsb 调度台</title>
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/app.css?v=20260922-log-columns">
 </head>
 <body>
 <div class="shell">
@@ -98,7 +98,6 @@
     <div class="pane" id="pane-overview"></div>
     <div class="pane" id="pane-logs" hidden>
       <div class="filters" style="position:static;padding:0 0 10px;border:0;background:none">
-        <select class="input" id="logSideSelect" style="max-width:220px"></select>
         <div class="segmented" id="logKindRow">
           <button type="button" data-kind="" class="active">全部</button>
           <button type="button" data-kind="tool">工具</button>
@@ -110,8 +109,8 @@
         <button class="btn ghost sm" id="logRefreshBtn" type="button">刷新</button>
       </div>
       <div class="logbox">
-        <div class="logbox-head"><div><strong>尾部增量日志</strong><span id="logCount"></span></div></div>
-        <div class="logstream" id="logStream"></div>
+        <div class="logbox-head"><div><strong>候选日志</strong><span id="logCount"></span></div></div>
+        <div class="logstreams" id="logStreams"></div>
       </div>
     </div>
     <div class="pane" id="pane-prompt" hidden>
@@ -121,7 +120,7 @@
 </div>
 </div>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=20260922-log-columns"></script>
 <script>
   const { $, $$, esc, debounce, fetchJson, postJson, fmtDuration, fmtAge, fmtClock, toast,
           initTheme, renderRail, renderMetrics, connectStream, renderKeyed, setText, setHtml, setAttr } = window.SoloApp;
@@ -140,7 +139,7 @@
   const state = {
     data: null, tasks: [], byId: new Map(),
     query: "", filter: "all", selectedId: null, detail: null,
-    tab: "overview", logSide: "A", logKind: "", logTimer: null,
+    tab: "overview", logKind: "", logTimer: null, logSeq: 0, logKeys: "",
     connected: false, error: "",
   };
 
@@ -257,6 +256,7 @@
     document.body.style.overflow = "";
     state.selectedId = null;
     state.detail = null;
+    state.logKeys = "";
     persistSelected(null);
     stopLogPolling();
     renderRows();
@@ -327,16 +327,7 @@
 
     setText($("#promptText"), task.promptText || "未读取到提示词文件。");
 
-    const keys = (task.units || []).map((unit) => unit.key);
-    if (!keys.length) keys.push("A");
-    const current = keys.includes(state.logSide) ? state.logSide : keys[0];
-    state.logSide = current;
-    setHtml($("#logSideSelect"), (task.units || []).map((unit) => {
-      const name = unit.mappedSide
-        ? `${unit.mappedSide} · ${unit.candidateId || unit.key}`
-        : (unit.candidateId || unit.key);
-      return `<option value="${esc(unit.key)}" ${unit.key === current ? "selected" : ""}>${esc(name)}</option>`;
-    }).join("") || `<option value="">无候选记录</option>`);
+    renderLogColumns();
     if (state.tab === "logs") startLogPolling();
   }
 
@@ -390,7 +381,49 @@
   }
 
   /* ------------------------------------------------------------ log polling */
-  function stopLogPolling() { clearInterval(state.logTimer); state.logTimer = null; }
+  function logUnits() {
+    const units = (state.detail && state.detail.units) || [];
+    return units.length ? units : [{ key: "A", label: "A", candidateId: "A" }];
+  }
+  function logUnitKey(unit, index = 0) {
+    return String(unit.key || unit.candidateId || `candidate-${index + 1}`);
+  }
+  function renderLogColumns() {
+    const units = logUnits();
+    const keys = units.map(logUnitKey);
+    const signature = units.map((unit, index) => (
+      [keys[index], unit.mappedSide || "", unit.candidateId || ""].join(":")
+    )).join("\u0000");
+    if (state.logKeys === signature) return;
+    state.logKeys = signature;
+    setHtml($("#logStreams"), units.map((unit, index) => {
+      const key = keys[index];
+      const name = unit.candidateId || unit.key || `candidate-${index + 1}`;
+      const marker = unit.mappedSide
+        ? `<span class="marker" data-side="${esc(unit.mappedSide)}">${esc(unit.mappedSide)}</span>`
+        : `<span class="marker none">—</span>`;
+      return `<section class="logcandidate" data-log-candidate="${esc(key)}">
+        <div class="logcandidate-head">
+          <div class="logcandidate-name" title="${esc(name)}">${marker}<strong>${esc(name)}</strong></div>
+          <span class="logcandidate-count" data-log-count="${esc(key)}">等待日志</span>
+        </div>
+        <div class="logcandidate-path" data-log-path="${esc(key)}">正在定位轨迹…</div>
+        <div class="logstream" data-log-stream="${esc(key)}"><div class="empty">等待日志…</div></div>
+      </section>`;
+    }).join(""));
+  }
+  function focusLogCandidate(key) {
+    const node = $$(".logcandidate").find((item) => item.dataset.logCandidate === String(key));
+    if (!node) return;
+    node.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+    node.classList.add("is-focused");
+    setTimeout(() => node.classList.remove("is-focused"), 1600);
+  }
+  function stopLogPolling() {
+    clearInterval(state.logTimer);
+    state.logTimer = null;
+    state.logSeq += 1;
+  }
   function startLogPolling() {
     stopLogPolling();
     refreshLog();
@@ -427,25 +460,68 @@
   }
 
   async function refreshLog() {
-    if (!state.selectedId || !state.logSide) return;
-    const stream = $("#logStream");
-    const atBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 40;
+    if (!state.selectedId) return;
+    renderLogColumns();
+    const units = logUnits();
+    const streams = new Map($$("[data-log-stream]").map((node) => [node.dataset.logStream, node]));
+    const counts = new Map($$("[data-log-count]").map((node) => [node.dataset.logCount, node]));
+    const paths = new Map($$("[data-log-path]").map((node) => [node.dataset.logPath, node]));
+    const viewports = new Map();
+    for (const [key, stream] of streams) {
+      viewports.set(key, {
+        scrollTop: stream.scrollTop,
+        atBottom: stream.scrollHeight - stream.scrollTop - stream.clientHeight < 40,
+      });
+    }
+    const seq = ++state.logSeq;
     try {
-      const data = await fetchJson(
-        `/api/tasks/${encodeURIComponent(state.selectedId)}/events`
-        + `?side=${encodeURIComponent(state.logSide)}&limit=300`, {}, 15000);
-      const all = data.events || [];
-      const events = state.logKind ? all.filter((event) => event.kind === state.logKind) : all;
-      setHtml(stream, events.length
-        ? events.map(renderEvent).join("")
-        : `<div class="empty">${state.logKind ? "该类型暂无事件。" : "还没有事件。任务启动后会自动刷新。"}</div>`);
-      const counts = {};
-      for (const event of all) counts[event.kind] = (counts[event.kind] || 0) + 1;
-      setText($("#logCount"), `${events.length}/${all.length} 条 · 工具 ${counts.tool || 0} · 输出 ${counts.assistant || 0} · 错误 ${(counts.error || 0) + (counts.warning || 0)}`);
-      setText($("#logMeta"), (data.path || "").split("/").slice(-3).join("/"));
-      stream.scrollTop = atBottom ? stream.scrollHeight : stream.scrollTop;
+      const results = await Promise.all(units.map(async (unit, index) => {
+        const key = logUnitKey(unit, index);
+        try {
+          const data = await fetchJson(
+            `/api/tasks/${encodeURIComponent(state.selectedId)}/events`
+            + `?side=${encodeURIComponent(key)}&limit=300`, {}, 15000);
+          return { key, data, error: null };
+        } catch (error) {
+          return { key, data: null, error };
+        }
+      }));
+      if (seq !== state.logSeq) return;
+      const totals = { all: 0, shown: 0, tool: 0, assistant: 0, error: 0 };
+      for (const result of results) {
+        const stream = streams.get(result.key);
+        if (!stream) continue;
+        if (result.error) {
+          setHtml(stream, `<div class="empty">事件读取失败：${esc(result.error.message)}</div>`);
+          setText(counts.get(result.key), "读取失败");
+          continue;
+        }
+        const all = result.data.events || [];
+        const events = state.logKind ? all.filter((event) => event.kind === state.logKind) : all;
+        setHtml(stream, events.length
+          ? events.map(renderEvent).join("")
+          : `<div class="empty">${state.logKind ? "该类型暂无事件。" : "还没有事件。任务启动后会自动刷新。"}</div>`);
+        const viewport = viewports.get(result.key);
+        stream.scrollTop = viewport && !viewport.atBottom ? viewport.scrollTop : stream.scrollHeight;
+        const countsForUnit = {};
+        for (const event of all) countsForUnit[event.kind] = (countsForUnit[event.kind] || 0) + 1;
+        setText(counts.get(result.key), `${events.length}/${all.length} 条 · 工具 ${countsForUnit.tool || 0} · 输出 ${countsForUnit.assistant || 0} · 错误 ${(countsForUnit.error || 0) + (countsForUnit.warning || 0)}`);
+        const path = result.data.path || "未找到轨迹文件";
+        const pathNode = paths.get(result.key);
+        if (pathNode) {
+          setText(pathNode, path.split("/").slice(-3).join("/"));
+          setAttr(pathNode, "title", path);
+        }
+        totals.all += all.length;
+        totals.shown += events.length;
+        totals.tool += countsForUnit.tool || 0;
+        totals.assistant += countsForUnit.assistant || 0;
+        totals.error += (countsForUnit.error || 0) + (countsForUnit.warning || 0);
+      }
+      setText($("#logCount"), `共 ${totals.shown}/${totals.all} 条 · 工具 ${totals.tool} · 输出 ${totals.assistant} · 错误 ${totals.error}`);
+      setText($("#logMeta"), `${units.length} 个候选 · 并列同步`);
     } catch (error) {
-      setHtml(stream, `<div class="empty">事件读取失败：${esc(error.message)}</div>`);
+      if (seq === state.logSeq) setText($("#logMeta"), `事件读取失败：${error.message}`);
     }
   }
 
@@ -575,11 +651,11 @@
     if (!jump || !state.detail) return;
     const unit = (state.detail.units || []).find((item) => item.key === jump.dataset.unitLog);
     if (!unit) return;
-    state.logSide = unit.key;
     state.tab = "logs";
     $$("#tabs button").forEach((node) => node.classList.toggle("active", node.dataset.tab === "logs"));
     $$(".pane").forEach((node) => { node.hidden = node.id !== "pane-logs"; });
     startLogPolling();
+    requestAnimationFrame(() => focusLogCandidate(unit.key));
   });
 
   // One candidate at a time: resuming both at once hides which one actually failed.
@@ -596,7 +672,6 @@
       toast(`操作失败：${error.message}`, true);
     }
   });
-  $("#logSideSelect").addEventListener("change", (event) => { state.logSide = event.target.value; startLogPolling(); });
   $("#logKindRow").addEventListener("click", (event) => {
     const button = event.target.closest("[data-kind]");
     if (!button) return;

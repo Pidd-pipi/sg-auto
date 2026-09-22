@@ -981,6 +981,20 @@ class QueueManager:
         value = str(self._automation_cfg().get("scheduleMode") or SCHEDULE_MODE_CONTAINERS).strip().lower()
         return value if value in SCHEDULE_MODES else SCHEDULE_MODE_CONTAINERS
 
+    def effective_refill_below(self) -> int:
+        """The refill threshold actually in force.
+
+        ``containerRefillBelow`` is only meaningful below the hard limit: a
+        threshold at or above it can never be reached, so the gate silently
+        becomes a no-op.  The historical config carried ``5`` against a hard
+        limit of ``6`` — the exact "stalls five containers early" problem the
+        refactor set out to remove — and once ``maxContainers`` was lowered the
+        threshold ended up above the limit and stopped doing anything at all.
+        """
+        hard = self._max_containers_limit()
+        configured = max(1, int(self._automation_cfg().get("containerRefillBelow") or DEFAULT_CONTAINER_REFILL_BELOW))
+        return max(1, min(configured, hard))
+
     def _max_containers_limit(self) -> int:
         automation = self._automation_cfg()
         limits: list[int] = []
@@ -1464,7 +1478,8 @@ class QueueManager:
             "roots": roots,
             "activeRoots": active_roots,
             "capacity": capacity,
-            "containerRefillBelow": max(1, int(self._automation_cfg().get("containerRefillBelow") or DEFAULT_CONTAINER_REFILL_BELOW)),
+            "containerRefillBelow": self.effective_refill_below(),
+            "containerRefillBelowConfigured": max(1, int(self._automation_cfg().get("containerRefillBelow") or DEFAULT_CONTAINER_REFILL_BELOW)),
             "maxContainers": max_containers,
             "maxTasks": max_tasks,
             "candidatesPerTask": candidates_per_task,
@@ -1553,7 +1568,8 @@ class QueueManager:
             "roots": roots,
             "activeRoots": active_roots,
             "capacity": int(self._automation_cfg().get("capacity") or 2),
-            "containerRefillBelow": max(1, int(self._automation_cfg().get("containerRefillBelow") or DEFAULT_CONTAINER_REFILL_BELOW)),
+            "containerRefillBelow": self.effective_refill_below(),
+            "containerRefillBelowConfigured": max(1, int(self._automation_cfg().get("containerRefillBelow") or DEFAULT_CONTAINER_REFILL_BELOW)),
             "maxContainers": self._max_containers_limit(),
             "maxTasks": int(self._automation_cfg().get("capacity") or 2),
             "candidatesPerTask": self._candidates_per_task(),
@@ -1689,7 +1705,6 @@ class QueueManager:
                     "state": "pending",
                     "variantId": str(project.get("variantId") or ""),
                     "remainingBefore": quota_before.get("remaining"),
-                    "remainingAfter": None,
                     "platformTaskId": "",
                     "platformTaskNo": "",
                     "deductedAt": "",
@@ -1810,8 +1825,7 @@ class QueueManager:
                         "state": "pending",
                         "variantId": (item.get("quota") or {}).get("variantId") or item.get("variantId") or "",
                         "remainingBefore": (item.get("quota") or {}).get("remainingBefore"),
-                        "remainingAfter": None,
-                        "platformTaskId": "",
+                            "platformTaskId": "",
                         "platformTaskNo": "",
                         "deductedAt": "",
                         "settledAt": "",
@@ -2409,7 +2423,7 @@ class QueueManager:
             batch = self._candidates_per_task()
             running_containers = int(capacity_detail.get("nonTestContainerCount") or 0)
             estimated_current = int(capacity_detail.get("estimatedNonTestContainers") or 0)
-            refill_below = max(1, int(self._automation_cfg().get("containerRefillBelow") or DEFAULT_CONTAINER_REFILL_BELOW))
+            refill_below = self.effective_refill_below()
 
             if mode == SCHEDULE_MODE_TASKS:
                 # Task-count mode: capacity is the only gate; each task still gets
@@ -2599,12 +2613,20 @@ class QueueManager:
             "platformTaskId": created.get("platformTaskId", ""),
             "platformTaskNo": created.get("platformTaskNo", ""),
             "platformRoundId": created.get("platformRoundId", ""),
-            "remainingAfter": created.get("projectUsageCount"),
+            # The create response reports how many times the project has been
+            # used, not how much quota is left.  Storing that in a field called
+            # ``remainingAfter`` made the ledger read "3 → 12" and look as if
+            # quota had gone up.
+            "usageCountAfter": created.get("projectUsageCount"),
         })
         item["quota"] = quota
         self._emit("info", "quota.prededucted", taskId=str(item.get("id") or ""),
                    projectCode=str(item.get("projectCode") or ""),
-                   detail=f"预扣除 {quota.get('remainingBefore')} → {quota.get('remainingAfter')}，taskNo={quota.get('platformTaskNo')}")
+                   detail=(
+                       f"预扣除成功 taskNo={quota.get('platformTaskNo')}，"
+                       f"领取前剩余 {quota.get('remainingBefore')}，"
+                       f"项目累计使用 {quota.get('usageCountAfter')}"
+                   ))
         return quota
 
     def refund_quota(self, item: dict[str, Any], platform: Any, reason: str) -> dict[str, Any]:

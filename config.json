@@ -28,13 +28,13 @@
   },
   "automation": {
     "tickSeconds": 3,
-    "capacity": 2,
+    "capacity": 3,
     "cooldownSeconds": 0,
     "startupTimeoutSeconds": 300,
     "terminalStabilitySeconds": 6,
     "waitTimeoutSeconds": 14400,
-    "maxContainers": 4,
-    "containerRefillBelow": 5,
+    "maxContainers": 5,
+    "containerRefillBelow": 4,
     "candidatesPerTask": 2,
     "containerReserveSeconds": 420,
     "anthropicBaseUrl": "https://llm2.jzxhnh.com",
@@ -43,7 +43,7 @@
     "keyConcurrency": {
       "maxParallelRequests": 8,
       "reservedSlots": 4,
-      "maxCandidateContainers": 4
+      "maxCandidateContainers": 5
     },
     "excludedProjectCodes": [
       "gb-501"

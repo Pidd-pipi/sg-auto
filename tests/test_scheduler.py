@@ -420,6 +420,20 @@ class SlotLifecycleTests(SchedulerTestCase):
 
         self.assertEqual(queue.slots.snapshot()["occupiedCount"], 1)
 
+    def test_reconcile_clears_missing_marker_paths_from_queue(self):
+        queue = build_queue(self.config, items=[platform_item(
+            status="pending",
+            slotMarkers=[str(self.root / "missing-marker.json")],
+            slotReservedAt="2026-09-20T00:00:00Z",
+        )])
+
+        loop = ReconcileLoop(queue, queue.jobs, log=None, platform=None)
+        actions = loop.run_once()
+
+        self.assertTrue(any(action["kind"] == "inactive-reservations" for action in actions))
+        self.assertEqual(queue._items[0]["slotMarkers"], [])
+        self.assertEqual(queue._items[0]["slotReservedAt"], "")
+
     def test_containers_appearing_releases_the_placeholders(self):
         queue = self._queue()
         queue.add_platform({"code": "gb-7", "name": "示例", "variantId": "v1"})

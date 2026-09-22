@@ -2750,6 +2750,7 @@ class ReconcileLoop:
         paused or otherwise not launching new work.
         """
         removed: list[str] = []
+        changed = False
         with self.queue._lock:
             items = {str(item.get("id") or ""): item for item in self.queue._items}
             active_ids = {
@@ -2780,16 +2781,27 @@ class ReconcileLoop:
                 ]
                 if not item["slotMarkers"]:
                     item["slotReservedAt"] = ""
-            if removed:
+                changed = True
+            for item in items.values():
+                markers = [str(marker) for marker in item.get("slotMarkers") or []]
+                existing = [marker for marker in markers if Path(marker).is_file()]
+                if existing == markers:
+                    continue
+                item["slotMarkers"] = existing
+                if not existing:
+                    item["slotReservedAt"] = ""
+                changed = True
+            if changed:
                 self.queue._save()
-        if not removed:
+        if not removed and not changed:
             return []
-        self._emit(
-            "reconcile.inactive_reservations",
-            detail=f"清理无活动队列项的槽位标记 {len(removed)} 个",
-            count=len(removed),
-        )
-        return [{"kind": "inactive-reservations", "paths": removed}]
+        if removed:
+            self._emit(
+                "reconcile.inactive_reservations",
+                detail=f"清理无活动队列项的槽位标记 {len(removed)} 个",
+                count=len(removed),
+            )
+        return [{"kind": "inactive-reservations", "paths": removed, "queueChanged": changed}]
 
     def _release_stale_reservations(self) -> list[dict[str, Any]]:
         """A claimed slot with no container after the reserve window."""

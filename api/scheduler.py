@@ -474,22 +474,12 @@ class JobManager:
         if not item_id:
             raise MonitorError("平台队列项缺少 id")
         key = f"platform:{item_id}"
+        script, worker, active_roots = self.validate_platform_runner()
         with self._lock:
             current = self._jobs.get(key)
             if current and current.get("status") == "running":
                 raise MonitorError(f"平台任务已在运行，PID={current.get('pid')}")
-            script = Path(str(self.config.get("skillScript") or DEFAULT_SKILL_SCRIPT)).expanduser().resolve()
-            worker = APP_DIR / "queue_worker.py"
-            if not script.is_file():
-                raise MonitorError(f"找不到 sologsb CLI：{script}")
-            if not worker.is_file():
-                raise MonitorError(f"找不到队列 worker：{worker}")
             push_helper = str((self.config.get("automation") or {}).get("codexQueuePush") or "").strip()
-            monitor_cfg = self.config.get("monitor") or {}
-            active_values = monitor_cfg.get("activeRoots") if "activeRoots" in monitor_cfg else self.config.get("roots") or [DEFAULT_ROOT]
-            active_roots = [Path(value).expanduser().resolve() for value in active_values or []]
-            if not active_roots:
-                raise MonitorError("未选择任何 Codex 任务目录，不能启动平台任务")
             bound_scope = Path(str(item.get("scopeRoot") or "")).expanduser().resolve() if str(item.get("scopeRoot") or "").strip() else None
             workdir = bound_scope if bound_scope in active_roots else active_roots[0]
             workdir.mkdir(parents=True, exist_ok=True)
@@ -594,6 +584,25 @@ class JobManager:
                 daemon=True,
             ).start()
             return copy.deepcopy(job)
+
+    def validate_platform_runner(self) -> tuple[Path, Path, list[Path]]:
+        """Validate static launch prerequisites without changing quota or slots."""
+        script = Path(str(self.config.get("skillScript") or DEFAULT_SKILL_SCRIPT)).expanduser().resolve()
+        worker = APP_DIR / "queue_worker.py"
+        if not script.is_file():
+            raise MonitorError(f"找不到 sologsb CLI：{script}")
+        if not worker.is_file():
+            raise MonitorError(f"找不到队列 worker：{worker}")
+        monitor_cfg = self.config.get("monitor") or {}
+        active_values = (
+            monitor_cfg.get("activeRoots")
+            if "activeRoots" in monitor_cfg
+            else self.config.get("roots") or [DEFAULT_ROOT]
+        )
+        active_roots = [Path(value).expanduser().resolve() for value in active_values or []]
+        if not active_roots:
+            raise MonitorError("未选择任何 Codex 任务目录，不能启动平台任务")
+        return script, worker, active_roots
 
     def _persist(self, job: dict[str, Any]) -> None:
         item_id = str(job.get("platformItemId") or "")
@@ -785,6 +794,12 @@ class ContainerLedger:
         over-subscribing the key.  The marker names are placeholders; they are
         released as soon as the task's real containers show up in ``docker ps``.
         """
+        # A retry can leave older markers behind when a previous launch failed
+        # before a worker existed.  Keep this operation idempotent per queue
+        # item so every scheduler pass replaces, rather than accumulates,
+        # reservations for that item.
+        if item_id:
+            self.release_for_item(item_id)
         markers: list[str] = []
         for index in range(max(1, int(count))):
             marker = self.reserve(
@@ -2639,6 +2654,23 @@ class QueueManager:
                         self._save()
                     return actions
 
+            try:
+                self.jobs.validate_platform_runner()
+            except MonitorError as exc:
+                changed = False
+                error = str(exc)
+                for item in self._items:
+                    if item.get("status") != "pending" or item.get("source") != "platform":
+                        continue
+                    if str(item.get("error") or "") == error:
+                        continue
+                    item["error"] = error
+                    item["containerWait"] = "执行器不可启动，修复后自动继续"
+                    changed = True
+                if changed:
+                    self._save()
+                    self._emit("warning", "queue.runner_unavailable", detail=error)
+                return actions
             for item in self._items:
                 if mode == SCHEDULE_MODE_TASKS:
                     if capacity_in_use >= capacity:
@@ -2693,11 +2725,27 @@ class QueueManager:
                     try:
                         job = self.jobs.start_platform(item, reason="queue")
                     except (MonitorError, OSError) as exc:
+                        self.slots.release_for_item(item_id)
+                        quota = self._quota_of(item)
+                        if str(quota.get("state") or "") == "claimed":
+                            self.refund_quota(item, platform, f"任务启动失败：{exc}")
+                            item.update({
+                                "status": "failed",
+                                "finishedAt": utc_now(),
+                                "nextAttemptAt": "",
+                            })
+                        else:
+                            item["status"] = "pending"
                         item.update({
-                            "status": "pending",
                             "claimedAt": "",
+                            "startedAt": "",
+                            "jobPid": "",
                             "capacityHeld": False,
+                            "orphaned": False,
+                            "slotMarkers": [],
+                            "slotReservedAt": "",
                             "error": str(exc),
+                            "lastError": str(exc),
                         })
                         self._save()
                         self._emit("error", "queue.start_failed", taskId=str(item.get("id") or ""),
@@ -2879,6 +2927,7 @@ class ReconcileLoop:
     def run_once(self) -> list[dict[str, Any]]:
         actions: list[dict[str, Any]] = []
         actions.extend(self._sweep_dead_markers())
+        actions.extend(self._release_inactive_reservations())
         actions.extend(self._release_stale_reservations())
         actions.extend(self._release_terminal_containers())
         actions.extend(self._release_stuck_orphans())
@@ -2897,6 +2946,68 @@ class ReconcileLoop:
             return []
         self._emit("reconcile.dead_markers", detail=f"清理失效槽位标记 {len(removed)} 个", count=len(removed))
         return [{"kind": "dead-markers", "paths": removed}]
+
+    def _release_inactive_reservations(self) -> list[dict[str, Any]]:
+        """Release live-PID reservations that no active queue item owns.
+
+        Older versions could leave markers behind when ``start_platform``
+        failed after reserving slots.  Those markers keep counting until the
+        scheduler process exits, so clean them up even while the queue is
+        paused or otherwise not launching new work.
+        """
+        removed: list[str] = []
+        changed = False
+        with self.queue._lock:
+            items = {str(item.get("id") or ""): item for item in self.queue._items}
+            active_ids = {
+                item_id
+                for item_id, item in items.items()
+                if item_id and (
+                    str(item.get("status") or "") in QUEUE_ACTIVE_STATUSES
+                    or bool(item.get("capacityHeld"))
+                )
+            }
+            for path, data in self.queue.slots._read_markers():
+                item_id = str(data.get("itemId") or "")
+                # Executor-owned markers do not carry a queue item id.  Leave
+                # those to the executor/limiter; only clean monitor-owned
+                # reservations here.
+                if not item_id or item_id in active_ids:
+                    continue
+                path_text = str(path)
+                if not self.queue.slots.release(path):
+                    continue
+                removed.append(path_text)
+                item = items.get(item_id)
+                if item is None:
+                    continue
+                item["slotMarkers"] = [
+                    marker for marker in item.get("slotMarkers") or []
+                    if str(marker) != path_text
+                ]
+                if not item["slotMarkers"]:
+                    item["slotReservedAt"] = ""
+                changed = True
+            for item in items.values():
+                markers = [str(marker) for marker in item.get("slotMarkers") or []]
+                existing = [marker for marker in markers if Path(marker).is_file()]
+                if existing == markers:
+                    continue
+                item["slotMarkers"] = existing
+                if not existing:
+                    item["slotReservedAt"] = ""
+                changed = True
+            if changed:
+                self.queue._save()
+        if not removed and not changed:
+            return []
+        if removed:
+            self._emit(
+                "reconcile.inactive_reservations",
+                detail=f"清理无活动队列项的槽位标记 {len(removed)} 个",
+                count=len(removed),
+            )
+        return [{"kind": "inactive-reservations", "paths": removed, "queueChanged": changed}]
 
     def _release_stale_reservations(self) -> list[dict[str, Any]]:
         """A claimed slot with no container after the reserve window."""

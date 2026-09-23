@@ -7,6 +7,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 APP = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP))
@@ -55,6 +56,16 @@ def fake_docker(items):
             return dict(self._data)
 
     return _Docker({"items": items, "byName": {}, "error": "", "fetchedOk": True})
+
+
+def tick_with_ready_runner(queue, root):
+    """Run one scheduler tick with launch prerequisites mocked as ready."""
+    with mock.patch.object(
+        queue.jobs,
+        "validate_platform_runner",
+        return_value=(Path("/tmp/fake-sologsb.py"), Path("/tmp/queue_worker.py"), [root]),
+    ), mock.patch.object(queue.jobs, "start_platform", return_value={"pid": 1234}):
+        queue.tick()
 
 
 def platform_item(**overrides):
@@ -162,7 +173,7 @@ class ContainerGateTests(SchedulerTestCase):
         item = platform_item()
         queue._items = [item]
         queue._save()
-        queue.tick()
+        tick_with_ready_runner(queue, self.root)
         # The worker is not startable in a test, so the item stays pending — but it
         # must not be parked on any container-wait message.
         self.assertEqual(str(item.get("containerWait") or ""), "")
@@ -230,7 +241,7 @@ class StartupGuardTests(SchedulerTestCase):
         item = platform_item()
         queue._items = [item]
         queue._save()
-        queue.tick()
+        tick_with_ready_runner(queue, self.root)
         self.assertEqual(str(item.get("containerWait") or ""), "")
 
     def test_grace_defaults_to_100_seconds(self):
@@ -371,7 +382,7 @@ class CooldownTests(SchedulerTestCase):
         item = platform_item()
         queue._items = [item]
         queue._save()
-        queue.tick()
+        tick_with_ready_runner(queue, self.root)
         self.assertEqual(str(item.get("containerWait") or ""), "")
 
     def test_zero_cooldown_never_blocks(self):
@@ -380,7 +391,7 @@ class CooldownTests(SchedulerTestCase):
         item = platform_item()
         queue._items = [item]
         queue._save()
-        queue.tick()
+        tick_with_ready_runner(queue, self.root)
         self.assertEqual(str(item.get("containerWait") or ""), "")
 
 
@@ -568,11 +579,19 @@ class SlotLifecycleTests(SchedulerTestCase):
     def _queue(self):
         return build_queue(self.config)
 
+    def _ready_runner(self, queue):
+        return mock.patch.object(
+            queue.jobs,
+            "validate_platform_runner",
+            return_value=(Path("/tmp/fake-sologsb.py"), Path("/tmp/queue_worker.py"), [self.root]),
+        )
+
     def test_claim_reserves_one_slot_per_candidate(self):
         queue = self._queue()
         queue.add_platform({"code": "gb-7", "name": "示例", "variantId": "v1",
                             "quotaBefore": {"remaining": 3}})
-        queue.tick()
+        with self._ready_runner(queue), mock.patch.object(queue.jobs, "start_platform", return_value={"pid": 1234}):
+            queue.tick()
         markers = queue._items[0].get("slotMarkers") or []
         self.assertEqual(len(markers), self.config["automation"]["candidatesPerTask"])
         self.assertEqual(queue.slots.snapshot()["occupiedCount"], len(markers))
@@ -583,10 +602,91 @@ class SlotLifecycleTests(SchedulerTestCase):
         self.assertIn("pid", data)
         self.assertIn("createdAt", data)
 
+    def test_failed_start_releases_its_reservations(self):
+        queue = self._queue()
+        item = queue.add_platform({"code": "gb-7", "name": "示例", "variantId": "v1"})
+
+        with self._ready_runner(queue), mock.patch.object(
+            queue.jobs, "start_platform", side_effect=MonitorError("启动失败")
+        ):
+            queue.tick()
+        self.assertEqual(item["status"], "pending")
+        self.assertEqual(item["slotMarkers"], [])
+        self.assertFalse(item["capacityHeld"])
+        self.assertEqual(queue.slots.snapshot()["occupiedCount"], 0)
+
+    def test_reserve_batch_replaces_old_markers_for_the_same_item(self):
+        queue = self._queue()
+        first = queue.slots.reserve_batch(
+            count=2,
+            container_prefix="sologsb-gb-7",
+            project_code="gb-7",
+            item_id="platform-7",
+        )
+        second = queue.slots.reserve_batch(
+            count=2,
+            container_prefix="sologsb-gb-7",
+            project_code="gb-7",
+            item_id="platform-7",
+        )
+
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 2)
+        self.assertTrue(set(first).isdisjoint(second))
+        self.assertEqual(queue.slots.snapshot()["occupiedCount"], 2)
+
+    def test_reconcile_releases_markers_for_inactive_items(self):
+        queue = build_queue(self.config, items=[platform_item(status="pending")])
+        markers = queue.slots.reserve_batch(
+            count=2,
+            container_prefix="sologsb-gb-1",
+            project_code="gb-1",
+            item_id="platform-1",
+        )
+        queue._items[0]["slotMarkers"] = markers
+        queue._items[0]["slotReservedAt"] = "2026-09-20T00:00:00Z"
+        queue._save()
+
+        loop = ReconcileLoop(queue, queue.jobs, log=None, platform=None)
+        actions = loop.run_once()
+
+        self.assertTrue(any(action["kind"] == "inactive-reservations" for action in actions))
+        self.assertEqual(queue._items[0]["slotMarkers"], [])
+        self.assertEqual(queue._items[0]["slotReservedAt"], "")
+        self.assertEqual(queue.slots.snapshot()["occupiedCount"], 0)
+
+    def test_reconcile_does_not_remove_executor_owned_markers(self):
+        queue = self._queue()
+        marker = queue.slots.reserve(
+            container="sologsb-gb-1-candidate-1",
+            project_code="gb-1",
+        )
+        self.assertIsNotNone(marker)
+
+        loop = ReconcileLoop(queue, queue.jobs, log=None, platform=None)
+        loop.run_once()
+
+        self.assertEqual(queue.slots.snapshot()["occupiedCount"], 1)
+
+    def test_reconcile_clears_missing_marker_paths_from_queue(self):
+        queue = build_queue(self.config, items=[platform_item(
+            status="pending",
+            slotMarkers=[str(self.root / "missing-marker.json")],
+            slotReservedAt="2026-09-20T00:00:00Z",
+        )])
+
+        loop = ReconcileLoop(queue, queue.jobs, log=None, platform=None)
+        actions = loop.run_once()
+
+        self.assertTrue(any(action["kind"] == "inactive-reservations" for action in actions))
+        self.assertEqual(queue._items[0]["slotMarkers"], [])
+        self.assertEqual(queue._items[0]["slotReservedAt"], "")
+
     def test_containers_appearing_releases_the_placeholders(self):
         queue = self._queue()
         queue.add_platform({"code": "gb-7", "name": "示例", "variantId": "v1"})
-        queue.tick()
+        with self._ready_runner(queue), mock.patch.object(queue.jobs, "start_platform", return_value={"pid": 1234}):
+            queue.tick()
         self.assertTrue(queue._items[0]["slotMarkers"])
         task_root = self.root / "tasks" / "gb-7-20260920-120000-abc"
         task_root.mkdir(parents=True, exist_ok=True)
@@ -601,7 +701,8 @@ class SlotLifecycleTests(SchedulerTestCase):
     def test_release_for_item_clears_every_marker(self):
         queue = self._queue()
         queue.add_platform({"code": "gb-7", "name": "示例", "variantId": "v1"})
-        queue.tick()
+        with self._ready_runner(queue), mock.patch.object(queue.jobs, "start_platform", return_value={"pid": 1234}):
+            queue.tick()
         item_id = queue._items[0]["id"]
         self.assertTrue(queue.slots.release_for_item(item_id))
         self.assertEqual(queue.slots.snapshot()["occupiedCount"], 0)
@@ -650,6 +751,34 @@ class QuotaLedgerTests(SchedulerTestCase):
         self.assertEqual(quota["usageCountAfter"], 4)
         self.assertNotIn("remainingAfter", quota)
         self.assertEqual(platform.deducted, [("v-9", "0-1代码生成")])
+
+    def test_runner_preflight_blocks_before_quota_claim(self):
+        platform = self._Platform()
+        queue = self._queue_with_item()
+
+        queue.tick(platform=platform)
+
+        self.assertEqual(platform.deducted, [])
+        self.assertEqual(queue._items[0]["quota"]["state"], "pending")
+        self.assertIn("找不到 sologsb CLI", queue._items[0]["error"])
+
+    def test_item_level_start_failure_refunds_the_claim(self):
+        platform = self._Platform()
+        queue = self._queue_with_item()
+
+        with mock.patch.object(
+            queue.jobs,
+            "validate_platform_runner",
+            return_value=(Path("/tmp/fake-sologsb.py"), Path("/tmp/queue_worker.py"), [self.root]),
+        ), mock.patch.object(queue.jobs, "start_platform", side_effect=MonitorError("worker 启动失败")):
+            queue.tick(platform=platform)
+
+        quota = queue._items[0]["quota"]
+        self.assertEqual(platform.deducted, [("v-9", "0-1代码生成")])
+        self.assertEqual(platform.released, ["task-42"])
+        self.assertEqual(quota["state"], "refunded")
+        self.assertEqual(quota["refundMode"], "platform")
+        self.assertEqual(queue._items[0]["status"], "failed")
 
     def test_settle_marks_the_attempt_consumed(self):
         queue = self._queue_with_item()

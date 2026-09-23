@@ -1157,9 +1157,6 @@ class QueueManager:
                 state_status = str(state.get("status") or "")
             if state_status and state_status not in (TERMINAL_TASK_STATUSES | TASK_FAILURE_STATUSES):
                 return f"桌面任务仍处于 {state_status}"
-        stage = str(result.get("stage") or "")
-        if not state_status and stage in {"desktop-submitted", "desktop-task-running", "wait-timeout"}:
-            return f"任务执行阶段仍为 {stage}，尚未确认停止"
         if task_root is not None and self.docker_cache is not None:
             try:
                 names = task_container_names(task_root.name, self.docker_cache.get())
@@ -1170,6 +1167,25 @@ class QueueManager:
         job = self.jobs.get_platform(str(item.get("id") or ""), str(item.get("runKey") or ""))
         if job and job.get("status") == "running" and persisted_job_process_alive(job):
             return "监控执行器仍在运行"
+        stage = str(result.get("stage") or "")
+        if not state_status and stage in {"desktop-submitted", "desktop-task-running", "wait-timeout"}:
+            # The stage alone is not proof of a live desktop task: the worker may
+            # have exited after submitting a deep link and never produced a task
+            # state or container.  Hold only for a bounded grace period; after
+            # that, an old, uncorroborated result must not pin capacity forever.
+            grace = DEFAULT_ORPHAN_GRACE_SECONDS
+            try:
+                grace = max(60.0, float(self._automation_cfg().get("orphanGraceSeconds") or grace))
+            except (TypeError, ValueError):
+                pass
+            grace = max(grace, self._startup_timeout())
+            age = None
+            try:
+                age = max(0.0, time.time() - result_file.stat().st_mtime)
+            except OSError:
+                pass
+            if age is None or age < grace:
+                return f"任务执行阶段仍为 {stage}，尚未确认停止"
         return ""
 
     @staticmethod

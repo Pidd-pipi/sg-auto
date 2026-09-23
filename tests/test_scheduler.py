@@ -437,6 +437,42 @@ class ReconcileTests(SchedulerTestCase):
     def _queue(self, items, docker_items=None):
         return build_queue(self.config, items=items, docker=fake_docker(docker_items or []))
 
+    def _result_file(self, *, age_seconds: float) -> Path:
+        path = self.root / "result.json"
+        path.write_text(json.dumps({"status": "running", "stage": "desktop-submitted"}), encoding="utf-8")
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def test_recent_uncorroborated_desktop_stage_holds_the_slot(self):
+        item = platform_item(
+            status="orphaned",
+            capacityHeld=True,
+            orphaned=True,
+            resultFile=str(self._result_file(age_seconds=10)),
+        )
+        queue = self._queue([item])
+
+        self.assertIn("desktop-submitted", queue.live_task_reason(item))
+
+    def test_old_uncorroborated_desktop_stage_releases_the_slot(self):
+        item = platform_item(
+            status="orphaned",
+            capacityHeld=True,
+            orphaned=True,
+            triggeredAt="2020-01-01T00:00:00Z",
+            resultFile=str(self._result_file(age_seconds=10_000)),
+        )
+        queue = self._queue([item])
+        loop = ReconcileLoop(queue, queue.jobs, log=None, platform=None)
+
+        actions = loop.run_once()
+
+        self.assertEqual(queue.live_task_reason(item), "")
+        self.assertTrue(any(action["kind"] == "orphan-released" for action in actions))
+        self.assertEqual(item["status"], "skipped")
+        self.assertFalse(item["capacityHeld"])
+
     def test_dead_markers_are_swept(self):
         queue = self._queue([])
         marker = queue.slots.reserve(container="sologsb-gb-1-a-1", project_code="gb-1", item_id="platform-1")

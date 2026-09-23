@@ -100,6 +100,8 @@
               <div class="field"><label>启动超时 startupTimeout（秒）</label><input class="input" id="startupTimeoutInput" type="number" min="300" max="600" step="30"></div>
               <div class="field"><label>容器预占位 containerReserve（秒）</label><input class="input" id="reserveInput" type="number" min="300" max="600" step="30"></div>
               <div class="field"><label>纠错周期 reconcile（秒）</label><input class="input" id="reconcileInput" type="number" min="15" max="3600" step="15"></div>
+              <div class="field"><label>启动保护期 startupGrace（秒）</label><input class="input" id="graceInput" type="number" min="0" max="3600" step="10">
+                <span class="hint">启动后先读取任务与容器状态，期间不启动新任务，避免按空 world 计算容量而超发。</span></div>
             </div>
             <div class="panel-body" style="border-top:1px solid var(--line)">
               <div class="row-inline">
@@ -336,6 +338,7 @@
     set("#startupTimeoutInput", queue.startupTimeoutSeconds);
     set("#reserveInput", queue.containerReserveSeconds);
     set("#reconcileInput", queue.reconcileSeconds);
+    set("#graceInput", queue.startupGraceSeconds);
     set("#cooldownInput", queue.cooldownSeconds);
     const weights = (queue.autoRefill || {}).taskTypeWeights || {};
     set("#weightInput", weights["feature迭代"] ?? 80);
@@ -423,7 +426,11 @@
     if (!button || button.disabled) return;
     const { q, id } = button.dataset;
     try {
-      if (q === "release") { await act("queue-release", { itemId: id }); toast("已释放并发名额"); }
+      if (q === "release") {
+        if (!window.confirm("只有在确认桌面任务、候选容器和终端进程都已停止后，才能释放并发名额。继续检查并释放？")) return;
+        await act("queue-release", { itemId: id });
+        toast("已释放并发名额");
+      }
       else if (q === "retry") { await act("queue-retry", { itemId: id }); toast("已重新入队"); }
       else if (q === "remove") { await act("queue-remove", { itemId: id }); }
       else if (q === "disable") {
@@ -476,6 +483,7 @@
         startupTimeoutSeconds: Number($("#startupTimeoutInput").value),
         containerReserveSeconds: Number($("#reserveInput").value),
         reconcileSeconds: Number($("#reconcileInput").value),
+        startupGraceSeconds: Number($("#graceInput").value),
       });
       toast("上限参数已应用");
     } catch (error) { toast(`应用失败：${error.message}`, true); }

@@ -29,21 +29,22 @@
   "automation": {
     "tickSeconds": 3,
     "capacity": 3,
-    "cooldownSeconds": 0,
+    "cooldownSeconds": 210,
     "startupTimeoutSeconds": 300,
     "terminalStabilitySeconds": 6,
     "waitTimeoutSeconds": 14400,
-    "maxContainers": 5,
+    "maxContainers": 4,
     "containerRefillBelow": 4,
     "candidatesPerTask": 2,
     "containerReserveSeconds": 420,
     "anthropicBaseUrl": "https://llm2.jzxhnh.com",
     "scheduleMode": "containers",
     "reconcileSeconds": 60,
+    "startupGraceSeconds": 100,
     "keyConcurrency": {
       "maxParallelRequests": 8,
       "reservedSlots": 4,
-      "maxCandidateContainers": 5
+      "maxCandidateContainers": 4
     },
     "excludedProjectCodes": [
       "gb-501"

@@ -103,6 +103,10 @@ DEFAULT_CONTAINER_RESERVE_SECONDS = 420
 MIN_CONTAINER_RESERVE_SECONDS = 300
 MAX_CONTAINER_RESERVE_SECONDS = 600
 DEFAULT_RECONCILE_SECONDS = 60
+# On startup the queue has not yet read the task tree or docker, so a naive tick
+# would see "zero containers, zero tasks" and fire a whole batch.  Starts are
+# held off for this long while the state is read.
+DEFAULT_STARTUP_GRACE_SECONDS = 100
 DEFAULT_QUOTA_SETTLE_TIMEOUT_SECONDS = 6 * 3600
 DEFAULT_ORPHAN_GRACE_SECONDS = 1800
 
@@ -174,6 +178,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "anthropicBaseUrl": "https://llm2.jzxhnh.com",
         "scheduleMode": SCHEDULE_MODE_CONTAINERS,
         "reconcileSeconds": DEFAULT_RECONCILE_SECONDS,
+        "startupGraceSeconds": DEFAULT_STARTUP_GRACE_SECONDS,
         "keyConcurrency": {
             "maxParallelRequests": DEFAULT_KEY_MAX_PARALLEL_REQUESTS,
             "reservedSlots": DEFAULT_KEY_RESERVED_SLOTS,

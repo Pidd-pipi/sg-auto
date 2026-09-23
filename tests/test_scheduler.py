@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+import time
 import unittest
 from pathlib import Path
 
 APP = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP))
 
-from api.common import atomic_write_json  # noqa: E402
+from api.common import MonitorError, atomic_write_json, iso_from_timestamp, utc_now  # noqa: E402
 from api.scheduler import ContainerLedger, JobManager, QueueManager, ReconcileLoop  # noqa: E402
 from api.tasks import DockerCache  # noqa: E402
 from tests.support import SchedulerTestCase, make_config, state_dir_of, write_task  # noqa: E402
@@ -37,6 +39,10 @@ def build_queue(config, items=None, docker=None):
     if items is not None:
         queue._items = items
         queue._save()
+    # Production reaches tick() only after start() has read the task tree and
+    # docker and the grace period has elapsed; reproduce that here.
+    queue.state_loaded = True
+    queue.started_at = time.time() - 10_000
     return queue
 
 
@@ -145,32 +151,237 @@ class ContainerGateTests(SchedulerTestCase):
             for index in range(1, count + 1)
         ]
 
-    def test_starts_when_under_hard_limit_even_above_refill_threshold(self):
-        # maxContainers=6, candidatesPerTask=2 → 2 running containers is fine.
-        queue = self._queue(self._running(2), maxContainers=6, candidatesPerTask=2, containerRefillBelow=5)
+    def test_one_free_slot_is_enough_to_start(self):
+        """The executor queues overflow, so the monitor need not fit the batch.
+
+        Requiring room for all ``candidatesPerTask`` containers could only fire
+        at two containers against a limit of four, so the count oscillated
+        2↔4 and never sat at four.
+        """
+        queue = self._queue(self._running(3), maxContainers=4, candidatesPerTask=2, containerRefillBelow=4)
         item = platform_item()
         queue._items = [item]
         queue._save()
         queue.tick()
         # The worker is not startable in a test, so the item stays pending — but it
-        # must NOT be parked on the "waiting for refill threshold" message.
-        self.assertNotIn("补位阈值", str(item.get("containerWait") or ""))
+        # must not be parked on any container-wait message.
+        self.assertEqual(str(item.get("containerWait") or ""), "")
 
-    def test_waits_when_batch_would_exceed_hard_limit(self):
-        queue = self._queue(self._running(5), maxContainers=6, candidatesPerTask=2, containerRefillBelow=5)
+    def test_waits_when_no_slot_is_free(self):
+        queue = self._queue(self._running(4), maxContainers=4, candidatesPerTask=2, containerRefillBelow=4)
         item = platform_item()
         queue._items = [item]
         queue._save()
         queue.tick()
-        self.assertIn("硬上限", str(item.get("containerWait") or ""))
+        self.assertIn("容器已满", str(item.get("containerWait") or ""))
 
-    def test_refill_below_still_gates_in_container_mode(self):
+    def test_waits_at_the_hard_limit_even_with_a_batch_of_one(self):
+        queue = self._queue(self._running(6), maxContainers=6, candidatesPerTask=2, containerRefillBelow=6)
+        item = platform_item()
+        queue._items = [item]
+        queue._save()
+        queue.tick()
+        self.assertIn("容器已满", str(item.get("containerWait") or ""))
+
+    def test_refill_below_below_the_limit_still_gates(self):
+        """A threshold under the hard limit is a deliberate headroom knob."""
         queue = self._queue(self._running(4), maxContainers=6, candidatesPerTask=2, containerRefillBelow=3)
         item = platform_item()
         queue._items = [item]
         queue._save()
         queue.tick()
         self.assertIn("补位阈值", str(item.get("containerWait") or ""))
+
+
+class StartupGuardTests(SchedulerTestCase):
+    """A fresh process must not size capacity against an unread world."""
+
+    def _fresh_queue(self, grace=100):
+        config = make_config(self.root)
+        config["automation"]["startupGraceSeconds"] = grace
+        queue = build_queue(config)
+        # build_queue clears the guard; undo that to simulate a cold start.
+        queue.state_loaded = False
+        queue.started_at = time.time()
+        return queue
+
+    def test_blocks_before_the_state_is_read(self):
+        queue = self._fresh_queue()
+        queue.started_at = time.time() - 10_000  # grace long gone
+        item = platform_item()
+        queue._items = [item]
+        queue._save()
+        queue.tick()
+        self.assertIn("尚未读取", str(item.get("containerWait") or ""))
+
+    def test_blocks_during_the_grace_period(self):
+        queue = self._fresh_queue(grace=100)
+        queue.state_loaded = True
+        item = platform_item()
+        queue._items = [item]
+        queue._save()
+        queue.tick()
+        self.assertIn("启动保护期", str(item.get("containerWait") or ""))
+
+    def test_allows_once_state_is_read_and_grace_elapsed(self):
+        queue = self._fresh_queue(grace=100)
+        queue.state_loaded = True
+        queue.started_at = time.time() - 200
+        item = platform_item()
+        queue._items = [item]
+        queue._save()
+        queue.tick()
+        self.assertEqual(str(item.get("containerWait") or ""), "")
+
+    def test_grace_defaults_to_100_seconds(self):
+        queue = build_queue(make_config(self.root))
+        self.assertEqual(queue.startup_grace_seconds(), 100)
+
+    def test_grace_is_clamped(self):
+        config = make_config(self.root)
+        config["automation"]["startupGraceSeconds"] = 99999
+        queue = build_queue(config)
+        self.assertEqual(queue.startup_grace_seconds(), 3600)
+
+
+class StalledRetryTests(SchedulerTestCase):
+    """A stalled retry must not start a second attempt beside a live task."""
+
+    def _item(self, **over):
+        base = platform_item(status="running", capacityHeld=True, stalledRetrySeconds=600,
+                             stalledRetryLimit=1)
+        base.update(over)
+        return base
+
+    def _task_dir(self, name, status):
+        root_dir = self.root / "tasks" / name
+        (root_dir / "monitor").mkdir(parents=True, exist_ok=True)
+        (root_dir / "monitor" / "state.json").write_text(
+            json.dumps({"taskName": name, "status": status}), encoding="utf-8")
+        # Make the state file old enough to look stalled.
+        old = time.time() - 1200
+        os.utime(root_dir / "monitor" / "state.json", (old, old))
+        return root_dir
+
+    def test_holds_when_the_desktop_task_is_still_running(self):
+        task_root = self._task_dir("gb-1-20260920-120000-abc", "candidates_running")
+        config = make_config(self.root)
+        config["automation"]["stalledTaskRetrySeconds"] = 600
+        config["automation"]["stalledTaskRetryLimit"] = 1
+        queue = build_queue(config)
+        item = self._item(id="platform-1", taskRoot=str(task_root), runKey="rk1")
+        queue._items = [item]
+        queue._save()
+        queue._sync_running_locked()
+        # Must NOT go back to pending with a fresh run key.
+        self.assertEqual(item["status"], "orphaned")
+        self.assertTrue(item["capacityHeld"])
+        self.assertEqual(item["runKey"], "rk1")
+        self.assertIn("桌面任务仍处于", str(item.get("error") or ""))
+
+    def test_requeues_when_the_desktop_task_never_started(self):
+        """No state.json means nothing is running, so a retry is safe."""
+        config = make_config(self.root)
+        config["automation"]["stalledTaskRetrySeconds"] = 600
+        config["automation"]["stalledTaskRetryLimit"] = 1
+        queue = build_queue(config)
+        item = self._item(id="platform-2", taskRoot="", runKey="rk2")
+        queue._items = [item]
+        queue._save()
+        queue._sync_running_locked()
+        self.assertEqual(item["status"], "pending")
+        self.assertNotEqual(item["runKey"], "rk2")
+        self.assertEqual(item["stalledRetryCount"], 1)
+
+    def test_held_item_carries_an_orphan_timestamp(self):
+        task_root = self._task_dir("gb-4-20260920-120000-abc", "candidates_running")
+        config = make_config(self.root)
+        config["automation"]["stalledTaskRetrySeconds"] = 600
+        config["automation"]["stalledTaskRetryLimit"] = 1
+        queue = build_queue(config)
+        item = self._item(id="platform-4", taskRoot=str(task_root), runKey="rk4")
+        queue._items = [item]
+        queue._save()
+        queue._sync_running_locked()
+        # The grace-period release keys off this.
+        self.assertTrue(item.get("orphanedAt"))
+
+    def test_liveness_counts_candidate_trajectories(self):
+        """The outer state.json is untouched for a whole candidate attempt."""
+        task_root = self._task_dir("gb-3-20260920-120000-abc", "candidates_running")
+        attempt = task_root / "monitor" / "runtime" / "candidates" / "candidate-1" / "attempt-01"
+        attempt.mkdir(parents=True, exist_ok=True)
+        trace = attempt / "stdout.jsonl"
+        trace.write_text("{}\n", encoding="utf-8")  # fresh
+        config = make_config(self.root)
+        queue = build_queue(config)
+        stamp = queue._latest_activity_timestamp(
+            item={}, job=None, task_root=task_root, result_file=Path("/nonexistent"))
+        self.assertGreater(stamp, time.time() - 30)
+
+    def test_manual_release_is_blocked_while_desktop_task_is_live(self):
+        task_root = self._task_dir("gb-5-20260920-120000-abc", "candidates_running")
+        queue = build_queue(make_config(self.root))
+        item = platform_item(
+            id="platform-5",
+            status="orphaned",
+            capacityHeld=True,
+            orphaned=True,
+            taskRoot=str(task_root),
+        )
+        queue._items = [item]
+        queue._save()
+        with self.assertRaises(MonitorError):
+            queue.release(item["id"])
+        self.assertEqual(item["status"], "orphaned")
+        self.assertTrue(item["capacityHeld"])
+
+
+class CooldownTests(SchedulerTestCase):
+    """The minimum interval between task creations applies to every start."""
+
+    def _queue(self, cooldown):
+        config = make_config(self.root)
+        config["automation"]["cooldownSeconds"] = cooldown
+        return build_queue(config)
+
+    def test_recent_start_blocks_the_next_one(self):
+        queue = self._queue(210)
+        queue._lastStartedAt = utc_now()
+        item = platform_item()
+        queue._items = [item]
+        queue._save()
+        queue.tick()
+        self.assertIn("冷却", str(item.get("containerWait") or ""))
+
+    def test_cooldown_applies_without_prior_saturation(self):
+        """An idle queue used to fire several tasks back-to-back."""
+        queue = self._queue(210)
+        queue._lastStartedAt = utc_now()
+        self.assertFalse(queue._capacity_saturated)
+        item = platform_item()
+        queue._items = [item]
+        queue._save()
+        queue.tick()
+        self.assertIn("冷却", str(item.get("containerWait") or ""))
+
+    def test_expired_cooldown_lets_the_next_one_through(self):
+        queue = self._queue(210)
+        queue._lastStartedAt = iso_from_timestamp(time.time() - 400)
+        item = platform_item()
+        queue._items = [item]
+        queue._save()
+        queue.tick()
+        self.assertEqual(str(item.get("containerWait") or ""), "")
+
+    def test_zero_cooldown_never_blocks(self):
+        queue = self._queue(0)
+        queue._lastStartedAt = utc_now()
+        item = platform_item()
+        queue._items = [item]
+        queue._save()
+        queue.tick()
+        self.assertEqual(str(item.get("containerWait") or ""), "")
 
 
 class SlotLedgerTests(SchedulerTestCase):
@@ -329,6 +540,26 @@ class ReconcileTests(SchedulerTestCase):
         loop.run_once()
         self.assertEqual(item["status"], "skipped")
         self.assertFalse(item["capacityHeld"])
+
+    def test_stuck_orphan_keeps_slot_when_desktop_task_is_live(self):
+        task_root = self.root / "tasks" / "gb-6-20260920-120000-abc"
+        (task_root / "monitor").mkdir(parents=True, exist_ok=True)
+        (task_root / "monitor" / "state.json").write_text(
+            json.dumps({"status": "candidates_running"}), encoding="utf-8")
+        item = platform_item(
+            id="platform-6",
+            status="orphaned",
+            capacityHeld=True,
+            orphaned=True,
+            taskRoot=str(task_root),
+            triggeredAt="2020-01-01T00:00:00Z",
+        )
+        queue = self._queue([item])
+        loop = ReconcileLoop(queue, queue.jobs, log=None, platform=None)
+        loop.run_once()
+        self.assertEqual(item["status"], "orphaned")
+        self.assertTrue(item["capacityHeld"])
+        self.assertIn("桌面任务仍处于", str(item.get("notice") or ""))
 
 
 class SlotLifecycleTests(SchedulerTestCase):

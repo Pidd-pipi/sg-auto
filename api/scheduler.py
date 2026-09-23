@@ -40,6 +40,7 @@ from .common import (
     DEFAULT_QUEUE_RETRY_BACKOFF_SECONDS,
     DEFAULT_QUEUE_WAIT_TIMEOUT_SECONDS,
     DEFAULT_RECONCILE_SECONDS,
+    DEFAULT_STARTUP_GRACE_SECONDS,
     DEFAULT_ROOT,
     DEFAULT_SKILL_SCRIPT,
     DEFAULT_STALLED_TASK_RETRY_LIMIT,
@@ -868,6 +869,10 @@ class QueueManager:
         self.state_path = state_path or QUEUE_STATE_PATH
         self.slots = ContainerLedger(root=slot_root, docker_cache=docker_cache)
         self.blocked_codes = {str(code).casefold() for code in (blocked_codes or set())}
+        # Set by the service once it has read the task tree and docker at least
+        # once; see SchedulerService.startup_guard.
+        self.state_loaded = False
+        self.started_at = time.time()
         self._lock = threading.RLock()
         self._triggered: list[dict[str, Any]] = []
         self._lastStartedAt = ""
@@ -1121,6 +1126,36 @@ class QueueManager:
     @staticmethod
     def _item_holds_slot(item: dict[str, Any]) -> bool:
         return str(item.get("status") or "") in QUEUE_ACTIVE_STATUSES or bool(item.get("capacityHeld"))
+
+    def live_task_reason(self, item: dict[str, Any]) -> str:
+        """Describe work that still makes releasing this slot unsafe."""
+        result_file = Path(str(item.get("resultFile") or ""))
+        result = read_json(result_file, {}) if result_file else {}
+        if not isinstance(result, dict):
+            result = {}
+        raw_root = str(result.get("taskRoot") or item.get("taskRoot") or "")
+        task_root = Path(raw_root).expanduser().resolve() if raw_root else None
+        state_status = ""
+        if task_root is not None:
+            state = read_json(task_root / "monitor" / "state.json", {})
+            if isinstance(state, dict):
+                state_status = str(state.get("status") or "")
+            if state_status and state_status not in (TERMINAL_TASK_STATUSES | TASK_FAILURE_STATUSES):
+                return f"桌面任务仍处于 {state_status}"
+        stage = str(result.get("stage") or "")
+        if not state_status and stage in {"desktop-submitted", "desktop-task-running", "wait-timeout"}:
+            return f"任务执行阶段仍为 {stage}，尚未确认停止"
+        if task_root is not None and self.docker_cache is not None:
+            try:
+                names = task_container_names(task_root.name, self.docker_cache.get())
+            except Exception:
+                names = []
+            if names:
+                return f"仍有 {len(names)} 个候选容器运行"
+        job = self.jobs.get_platform(str(item.get("id") or ""), str(item.get("runKey") or ""))
+        if job and job.get("status") == "running" and persisted_job_process_alive(job):
+            return "监控执行器仍在运行"
+        return ""
 
     @staticmethod
     def _job_task_status(job: dict[str, Any]) -> str:
@@ -1487,6 +1522,7 @@ class QueueManager:
             "startupTimeoutSeconds": startup_timeout,
             "containerReserveSeconds": reserve_seconds,
             "reconcileSeconds": reconcile_seconds,
+            "startupGraceSeconds": self.startup_grace_seconds(),
             "mergeProjectPool": bool((self.config.get("platform") or {}).get("mergeProjectPool", False)),
             "keyConcurrency": copy.deepcopy(self._automation_cfg().get("keyConcurrency") or {}),
             "anthropicBaseUrl": str(self._automation_cfg().get("anthropicBaseUrl") or "https://llm2.jzxhnh.com"),
@@ -1577,6 +1613,7 @@ class QueueManager:
             "startupTimeoutSeconds": startup_timeout,
             "containerReserveSeconds": self._container_reserve_seconds(),
             "reconcileSeconds": clamp_int(self._automation_cfg().get("reconcileSeconds"), 15, 3600, DEFAULT_RECONCILE_SECONDS),
+            "startupGraceSeconds": self.startup_grace_seconds(),
             "mergeProjectPool": bool((self.config.get("platform") or {}).get("mergeProjectPool", False)),
             "keyConcurrency": copy.deepcopy(self._automation_cfg().get("keyConcurrency") or {}),
             "anthropicBaseUrl": str(self._automation_cfg().get("anthropicBaseUrl") or "https://llm2.jzxhnh.com"),
@@ -1844,6 +1881,12 @@ class QueueManager:
                 raise MonitorError("队列项不存在")
             if not self._item_holds_slot(item) or item.get("status") not in {"orphaned", "failed", "skipped"}:
                 raise MonitorError("只有已失去执行器且保留名额的失败项可以手动释放")
+            live_reason = self.live_task_reason(item)
+            if live_reason:
+                item["notice"] = f"{live_reason}，为防超额度已拒绝释放名额"
+                item["error"] = item["notice"]
+                self._save()
+                raise MonitorError(f"{live_reason}，不能释放并发名额；请先停止任务并等待终态")
             self.slots.release_for_item(item_id)
             item.update({
                 "status": "skipped",
@@ -1963,11 +2006,21 @@ class QueueManager:
             parsed = parse_time(value)
             if parsed is not None:
                 candidates.append(parsed.timestamp())
-        for path in (
-            (task_root / "monitor" / "state.json") if task_root is not None else None,
-            result_file if str(result_file) else None,
-        ):
-            if path is None or str(path) in {"", "."}:
+        paths: list[Path] = []
+        if task_root is not None:
+            paths.append(task_root / "monitor" / "state.json")
+            # The top-level state.json only changes when the task's *phase*
+            # changes.  While candidates race inside Docker they write
+            # continuously to their own trajectories and the outer state file
+            # stays untouched for the whole attempt — which can easily exceed
+            # the stall threshold.  Those files are the real liveness signal.
+            paths.extend(task_root.glob("monitor/runtime/**/stdout.jsonl"))
+            paths.extend(task_root.glob("monitor/runtime/**/attempt-*/*.json"))
+            paths.extend(task_root.glob("workspace/轨迹文件/**/stdout.jsonl"))
+        if str(result_file) not in {"", "."}:
+            paths.append(result_file)
+        for path in paths:
+            if not str(path):
                 continue
             try:
                 candidates.append(path.stat().st_mtime)
@@ -2181,6 +2234,40 @@ class QueueManager:
                 and latest_activity is not None
                 and stalled_seconds >= retry_after
             ):
+                # SIGTERM on the worker does not stop the ChatGPT desktop
+                # session it opened.  Requeueing while that session is still
+                # mid-flight starts a *second* concurrent attempt at the same
+                # project — two live candidate sets for one queue item.  So only
+                # requeue once the desktop task has actually reached a terminal
+                # state; otherwise hold the slot and let the orphan grace period
+                # deal with it.
+                desktop_still_running = task_started and state_status not in (
+                    TERMINAL_TASK_STATUSES | TASK_FAILURE_STATUSES
+                )
+                if desktop_still_running:
+                    item.update({
+                        "status": "orphaned",
+                        "jobPid": "",
+                        "claimedAt": "",
+                        "orphaned": True,
+                        "capacityHeld": True,
+                        # Start the orphan grace clock now, not from a timestamp
+                        # the item may not carry.
+                        "orphanedAt": utc_now(),
+                        "error": (
+                            f"任务已静默 {int(stalled_seconds)} 秒，但桌面任务仍处于 {state_status}；"
+                            "保留名额等待其终态，不重复启动"
+                        ),
+                        "notice": (
+                            f"静默 {int(stalled_seconds)} 秒，桌面任务仍在 {state_status}，"
+                            "等终态后由纠错循环处理"
+                        ),
+                    })
+                    changed = True
+                    self._emit("warning", "queue.stalled_held", taskId=item_id,
+                               projectCode=str(item.get("projectCode") or ""),
+                               detail=f"静默 {int(stalled_seconds)} 秒但桌面任务处于 {state_status}，保留名额不重试")
+                    continue
                 self.settle_quota(item, success=False, reason=f"任务静默 {int(stalled_seconds)} 秒后自动重试")
                 self.slots.release_for_item(item_id)
                 requeue_stalled(item, stalled_seconds=stalled_seconds)
@@ -2188,6 +2275,29 @@ class QueueManager:
                 self._emit("warning", "queue.stalled_retry", taskId=item_id,
                            projectCode=str(item.get("projectCode") or ""),
                            detail=f"静默 {int(stalled_seconds)} 秒，第 {stalled_retry_count + 1} 次自动重试")
+                changed = True
+                continue
+
+            worker_alive = bool(job and job.get("status") == "running" and persisted_job_process_alive(job))
+            if (
+                retry_limit > 0
+                and stalled_retry_count < retry_limit
+                and str(item.get("status") or "") in QUEUE_ACTIVE_STATUSES
+                and item.get("capacityHeld")
+                and not task_started
+                and not desktop_submitted
+                and not worker_alive
+            ):
+                # The executor exited before it ever created a desktop task.
+                # Releasing and retrying is safe because there is no orphan to
+                # race with the next attempt.
+                self.settle_quota(item, success=False, reason="执行器在创建桌面任务前退出")
+                self.slots.release_for_item(item_id)
+                requeue_stalled(item, stalled_seconds=retry_after)
+                item["slotMarkers"] = []
+                self._emit("warning", "queue.stalled_retry", taskId=item_id,
+                           projectCode=str(item.get("projectCode") or ""),
+                           detail=f"执行器未创建桌面任务，第 {stalled_retry_count + 1} 次自动重试")
                 changed = True
                 continue
 
@@ -2365,6 +2475,27 @@ class QueueManager:
         item["quota"] = quota
 
     # -- tick ------------------------------------------------------------- #
+    def startup_grace_seconds(self) -> int:
+        return clamp_int(
+            self._automation_cfg().get("startupGraceSeconds"), 0, 3600, DEFAULT_STARTUP_GRACE_SECONDS
+        )
+
+    def startup_guard(self) -> tuple[bool, str]:
+        """Whether it is safe to start work yet.
+
+        A fresh process has not read the task tree, docker, or the queue's own
+        persisted state.  Starting tasks during that window would size capacity
+        against an empty world and over-commit, so starts wait until the state
+        has been read *and* the grace period has elapsed.
+        """
+        elapsed = time.time() - self.started_at
+        grace = self.startup_grace_seconds()
+        if not self.state_loaded:
+            return False, "启动保护期：尚未读取任务与容器状态"
+        if elapsed < grace:
+            return False, f"启动保护期：已读取状态，距可启动还有 {int(grace - elapsed)} 秒"
+        return True, ""
+
     def tick(self, platform: Any = None) -> list[dict[str, Any]]:
         actions: list[dict[str, Any]] = []
         with self._lock:
@@ -2387,6 +2518,19 @@ class QueueManager:
                 self._save()
             if bool(self._automation_cfg().get("paused", True)):
                 return actions
+            allowed, guard_reason = self.startup_guard()
+            if not allowed:
+                changed = False
+                for pending_item in self._items:
+                    if pending_item.get("status") != "pending" or pending_item.get("source") != "platform":
+                        continue
+                    pending_item["containerWait"] = guard_reason
+                    pending_item["error"] = guard_reason
+                    changed = True
+                    break
+                if changed:
+                    self._save()
+                return actions
             if not self._active_roots_locked():
                 changed = False
                 for item in self._items:
@@ -2400,13 +2544,28 @@ class QueueManager:
             capacity = int(self._automation_cfg().get("capacity") or 2)
             cooldown_seconds = max(0, int(self._automation_cfg().get("cooldownSeconds") or 0))
             last_started = parse_time(self._lastStartedAt)
-            if (
-                self._capacity_saturated
-                and last_started
-                and cooldown_seconds
-                and time.time() - last_started.timestamp() < cooldown_seconds
-            ):
-                return actions
+            # The cooldown gates every start, not just the ones after saturation.
+            # Gating it on ``_capacity_saturated`` let an idle queue fire several
+            # tasks back-to-back the moment capacity appeared, which is exactly
+            # the burst the minimum interval is meant to prevent.
+            if last_started and cooldown_seconds:
+                since_last = time.time() - last_started.timestamp()
+                if since_last < cooldown_seconds:
+                    remaining = int(cooldown_seconds - since_last)
+                    changed = False
+                    for pending_item in self._items:
+                        if pending_item.get("status") != "pending" or pending_item.get("source") != "platform":
+                            continue
+                        pending_item["containerWait"] = (
+                            f"任务创建冷却中：距上次启动 {int(since_last)} 秒，"
+                            f"还需 {remaining} 秒（间隔要求 > {cooldown_seconds} 秒）"
+                        )
+                        pending_item["error"] = pending_item["containerWait"]
+                        changed = True
+                        break
+                    if changed:
+                        self._save()
+                    return actions
             capacity_in_use, capacity_detail = self._capacity_usage_locked(startup_timeout)
             if not bool(capacity_detail.get("dockerReady", False)):
                 for pending_item in self._items:
@@ -2421,7 +2580,9 @@ class QueueManager:
 
             hard_limit = self._max_containers_limit()
             batch = self._candidates_per_task()
-            running_containers = int(capacity_detail.get("nonTestContainerCount") or 0)
+            # Both container gates use the estimated count (running containers
+            # plus this monitor's own reservations) so a claimed-but-not-started
+            # task is accounted for exactly as the skill's limiter accounts for it.
             estimated_current = int(capacity_detail.get("estimatedNonTestContainers") or 0)
             refill_below = self.effective_refill_below()
 
@@ -2432,17 +2593,23 @@ class QueueManager:
                     self._capacity_saturated = True
                     return actions
             else:
-                # Container mode: only wait when this batch would exceed the hard
-                # limit.  The old code compared running >= refillBelow, which
-                # stalled five containers before a six-container limit.
-                if hard_limit > 0 and estimated_current + batch > hard_limit:
+                # Container mode: start as soon as one slot is free.
+                #
+                # The gate used to require room for the whole batch
+                # (``est + candidatesPerTask > hard``), which with a batch of 2
+                # against a limit of 4 could only fire at two containers — so the
+                # count oscillated 2↔4 and never sat at 4.  The executor's
+                # ``_ContainerLimiter`` queues candidates once the limit is
+                # reached, so the monitor only has to keep one slot open and let
+                # the skill absorb the overflow.
+                if hard_limit > 0 and estimated_current + 1 > hard_limit:
                     changed = False
                     for pending_item in self._items:
                         if pending_item.get("status") != "pending" or pending_item.get("source") != "platform":
                             continue
                         pending_item["containerWait"] = (
-                            f"等待容器额度：当前预计 {estimated_current} 个，"
-                            f"本任务预计新增 {batch} 个，硬上限 {hard_limit}"
+                            f"容器已满：当前预计 {estimated_current} 个，硬上限 {hard_limit}，"
+                            f"技能侧将在 {hard_limit} 个时排队"
                         )
                         pending_item["error"] = pending_item["containerWait"]
                         changed = True
@@ -2453,14 +2620,17 @@ class QueueManager:
                 if capacity_in_use >= capacity:
                     self._capacity_saturated = True
                     return actions
-                if running_containers >= refill_below:
+                # The refill threshold is the top-up target.  Clamped to the hard
+                # limit, so this agrees with the gate above rather than
+                # short-circuiting it.
+                if estimated_current >= refill_below:
                     changed = False
                     for pending_item in self._items:
                         if pending_item.get("status") != "pending" or pending_item.get("source") != "platform":
                             continue
                         pending_item["containerWait"] = (
-                            f"当前运行候选容器 {running_containers} 个，"
-                            f"等待低于补位阈值 {refill_below} 后启动"
+                            f"当前预计 {estimated_current} 个容器，"
+                            f"达到补位阈值 {refill_below}，等有空位再启动"
                         )
                         pending_item["error"] = pending_item["containerWait"]
                         changed = True
@@ -2476,7 +2646,7 @@ class QueueManager:
                 else:
                     if capacity_in_use >= capacity:
                         break
-                    if hard_limit > 0 and estimated_current + batch > hard_limit:
+                    if hard_limit > 0 and estimated_current + 1 > hard_limit:
                         break
                 if item.get("status") != "pending":
                     continue
@@ -2843,6 +3013,15 @@ class ReconcileLoop:
                 if age is None or age < grace:
                     continue
                 item_id = str(item.get("id") or "")
+                live_reason = self.queue.live_task_reason(item)
+                if live_reason:
+                    item["notice"] = f"{live_reason}，保留并发名额直到任务停止"
+                    item["error"] = item["notice"]
+                    self.queue._save()
+                    self._emit("reconcile.orphan_held", taskId=item_id,
+                               projectCode=str(item.get("projectCode") or ""),
+                               detail=f"orphaned 超过 {int(age)} 秒但 {live_reason}，拒绝释放名额")
+                    continue
                 self.queue.slots.release_for_item(item_id)
                 if self.platform is not None:
                     self.queue.refund_quota(item, self.platform, f"orphaned 超过 {int(age)} 秒无终态")

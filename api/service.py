@@ -24,6 +24,7 @@ from typing import Any
 from .common import (
     AUTO_STATE_PATH,
     DEFAULT_ROOT,
+    DEFAULT_STARTUP_GRACE_SECONDS,
     DISMISSED_TASKS_PATH,
     QUEUE_ACTIVE_STATUSES,
     SIDES,
@@ -250,6 +251,7 @@ class SchedulerService:
         self._stop = threading.Event()
         self._loops: list[threading.Thread] = []
         self.started_at = time.time()
+        self._snapshot_builds = 0
         self.log.emit("service.started", detail=f"pid={os.getpid()} 扫描目录={', '.join(self.queue.active_roots())}")
 
     # -- persisted small state ------------------------------------------- #
@@ -297,6 +299,16 @@ class SchedulerService:
         # server.py injects the settings store after construction, so anything
         # that depends on saved settings has to happen here.
         self._sync_blocklist()
+        # Read the world once before any scheduling decision can be made.
+        try:
+            self.build_snapshot()
+        except Exception as exc:
+            self.log.emit("service.state_load_failed", level="error", detail=str(exc))
+        grace = self.queue.startup_grace_seconds()
+        self.log.emit(
+            "service.startup_guard",
+            detail=f"启动保护期 {grace} 秒，期间不启动新任务（读取状态后开始倒计时）",
+        )
         orphans = getattr(self.jobs, "_orphans_reaped", []) or []
         if orphans:
             self.log.emit(
@@ -358,6 +370,17 @@ class SchedulerService:
 
     def build_snapshot(self) -> dict[str, Any]:
         now = time.time()
+        self._snapshot_builds += 1
+        if self._snapshot_builds == 1:
+            # First full read of the task tree, docker and the queue's own state.
+            self.queue.state_loaded = True
+            self.log.emit(
+                "service.state_loaded",
+                detail=(
+                    f"已读取 {len(self.queue.active_roots())} 个目录，"
+                    f"启动保护期剩余 {max(0, self.queue.startup_grace_seconds() - int(time.time() - self.queue.started_at))} 秒"
+                ),
+            )
         roots = [Path(value).expanduser().resolve() for value in self.config.get("roots") or [DEFAULT_ROOT]]
         active_roots = self._active_roots()
         with self._lock:
@@ -532,7 +555,7 @@ class SchedulerService:
         if action == "set-cooldown":
             value = int(payload.get("cooldownSeconds") or 0)
             if value < 0 or value > 86400:
-                raise MonitorError("任务冷却时间必须在 0 到 86400 秒之间")
+                raise MonitorError("任务创建间隔必须在 0 到 86400 秒之间")
             self.config.setdefault("automation", {})["cooldownSeconds"] = value
             self._persist_config()
             self.log.emit("config.cooldown", detail=f"冷却 → {value}s")
@@ -687,6 +710,11 @@ class SchedulerService:
                 payload.get("containerReserveSeconds"), 300, 600, 420
             )
             changes.append(f"containerReserveSeconds={automation['containerReserveSeconds']}")
+        if "startupGraceSeconds" in payload:
+            automation["startupGraceSeconds"] = clamp_int(
+                payload.get("startupGraceSeconds"), 0, 3600, DEFAULT_STARTUP_GRACE_SECONDS
+            )
+            changes.append(f"startupGraceSeconds={automation['startupGraceSeconds']}")
         if "reconcileSeconds" in payload:
             automation["reconcileSeconds"] = clamp_int(payload.get("reconcileSeconds"), 15, 3600, 60)
             changes.append(f"reconcileSeconds={automation['reconcileSeconds']}")

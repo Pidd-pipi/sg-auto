@@ -579,13 +579,29 @@
   }
 
   /* -------------------------------------------------------------- rendering */
+  function mergeTaskCards(tasks, changed = new Map(), removed = new Set()) {
+    const merged = [];
+    const seen = new Set();
+    for (const task of tasks) {
+      if (!task || !task.id || removed.has(task.id) || seen.has(task.id)) continue;
+      merged.push(changed.get(task.id) || task);
+      seen.add(task.id);
+    }
+    for (const task of changed.values()) {
+      if (!task || !task.id || removed.has(task.id) || seen.has(task.id)) continue;
+      merged.push(task);
+      seen.add(task.id);
+    }
+    return merged;
+  }
+
   function applySnapshot(payload) {
     state.data = payload;
-    state.tasks = payload.tasks || [];
+    state.tasks = mergeTaskCards(payload.tasks || []);
     state.byId = new Map(state.tasks.map((task) => [task.id, task]));
     renderRail({ ...payload, connected: state.connected, error: state.error });
     renderMetrics(payload);
-    setText($("#headMeta"), `${payload.tasks.length} 个任务 · ${fmtClock(payload.generatedAt)}`);
+    setText($("#headMeta"), `${state.tasks.length} 个任务 · ${fmtClock(payload.generatedAt)}`);
     const folder = (payload.folders || []).find((item) => item.id === payload.selectedFolderId);
     setText($("#scopeHint"), folder
       ? `范围：${folder.name} → ${payload.selectedFolderPath || "—"}`
@@ -602,8 +618,7 @@
     if (!state.data) return;
     const changed = new Map((payload.changed || []).map((task) => [task.id, task]));
     const removed = new Set(payload.removed || []);
-    state.tasks = state.tasks.filter((task) => !removed.has(task.id));
-    for (const task of changed.values()) state.tasks.push(task);
+    state.tasks = mergeTaskCards(state.tasks, changed, removed);
     state.byId = new Map(state.tasks.map((task) => [task.id, task]));
     if (payload.summary) state.data.summary = payload.summary;
     if (payload.queue) state.data.queue = payload.queue;
